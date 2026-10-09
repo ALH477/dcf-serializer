@@ -142,6 +142,7 @@ ifneq ($(GATE),0)
 	LD_LIBRARY_PATH=. ./$(DIFF_BIN)
 	./$(GUARD_BIN)
 endif
+	@if command -v python3 >/dev/null 2>&1; then $(MAKE) --no-print-directory interop; else echo "[skip] interop: python3 not found"; fi
 
 # The writer's ZigZag / LEB128 / CRC-32 against an independent decoder (Python, zlib) and the
 # standard ZigZag vectors. Needs python3.

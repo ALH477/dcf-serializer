@@ -405,7 +405,8 @@ DCFSerError dcf_ser_write_f64(DCFSerWriter* w, double val);
  * ---------------------------------------------------------------------------- */
 
 /**
- * Write variable-length integer (LEB128)
+ * Write variable-length integer (LEB128). varsint is ZigZag first: (n << 1) ^ (n >> 63) with an
+ * arithmetic shift, so 0, -1, 1, -2, 2 become 0, 1, 2, 3, 4 and INT64_MIN becomes 2^64-1.
  */
 DCFSerError dcf_ser_write_varint(DCFSerWriter* w, uint64_t val);
 DCFSerError dcf_ser_write_varsint(DCFSerWriter* w, int64_t val);

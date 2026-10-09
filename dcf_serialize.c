@@ -556,8 +556,13 @@ DCFSerError dcf_ser_write_varint(DCFSerWriter* w, uint64_t val) {
 }
 
 DCFSerError dcf_ser_write_varsint(DCFSerWriter* w, int64_t val) {
-    /* ZigZag encoding: (n << 1) ^ (n >> 63) */
-    uint64_t zigzag = ((uint64_t)val << 1) ^ ((uint64_t)val >> 63);
+    /* ZigZag encoding: (n << 1) ^ (n >> 63), where the shift is ARITHMETIC (a sign fill: all ones
+     * for a negative n, all zeros otherwise). Right-shifting a negative signed value is
+     * implementation-defined and shifting the unsigned copy is a logical shift (0 or 1), so the
+     * sign fill is spelled out: 0 - (sign bit). -1 -> 1, 1 -> 2, INT64_MIN -> UINT64_MAX. */
+    uint64_t u = (uint64_t)val;
+    uint64_t sign_fill = (uint64_t)0 - (u >> 63);
+    uint64_t zigzag = (u << 1) ^ sign_fill;
     return dcf_ser_write_varint(w, zigzag);
 }
 
