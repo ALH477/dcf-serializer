@@ -586,10 +586,7 @@ static int t_s4_extended_and_reserved_never_allowed(void) {
 #ifdef DCF_SER_HARDENED_API
     Buf b = {0};
     b8(&b, 0x02); b8(&b, 0x09);
-    const uint32_t every = DCF_SER_POLICY_ALLOW_NO_CRC | DCF_SER_POLICY_ALLOW_TRAILING |
-        DCF_SER_POLICY_ALLOW_NONCANONICAL_VARINT | DCF_SER_POLICY_ALLOW_INVALID_UTF8 |
-        DCF_SER_POLICY_NO_GATE | DCF_SER_POLICY_ALLOW_UNSTRUCTURED | DCF_SER_POLICY_LAX_SCHEMA |
-        DCF_SER_POLICY_ALLOW_APP_FLAGS;
+    const uint32_t every = DCF_SER_POLICY_ALL;                  /* every flag at once */
     static const uint8_t never[] = {0x80, 0x40};
     for (size_t i = 0; i < sizeof never; i++) {
         size_t flen;
