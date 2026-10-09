@@ -34,6 +34,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ============================================================================
@@ -242,6 +243,30 @@ static int t_s0_roundtrip_all_types(void) {
     CHECK_EQ(count, 20);
     CHECK_EQ(dcf_ser_reader_remaining(&r), 0);
     CHECK_OK(dcf_ser_validate_message(d, n));
+
+    /* and read the scalars back as VALUES, not just over them (a skip-only round trip is how
+     * the sign-fill bug in write_varsint went unnoticed) */
+    DCFSerReader t;
+    CHECK_OK(dcf_ser_reader_init(&t, d, n));
+    CHECK_OK(dcf_ser_reader_validate(&t));
+    bool bv; uint8_t u8v; int16_t i16v; uint32_t u32v; int64_t i64v; float fv; double dv; uint64_t uv; int64_t sv;
+    CHECK_OK(dcf_ser_read_null(&t));
+    CHECK_OK(dcf_ser_read_bool(&t, &bv));      CHECK(bv);
+    CHECK_OK(dcf_ser_read_u8(&t, &u8v));       CHECK_EQ(u8v, 1);
+    CHECK_OK(dcf_ser_read_i16(&t, &i16v));     CHECK_EQ(i16v, -2);
+    CHECK_OK(dcf_ser_read_u32(&t, &u32v));     CHECK_EQ(u32v, 3);
+    CHECK_OK(dcf_ser_read_i64(&t, &i64v));     CHECK(i64v == -4);
+    CHECK_OK(dcf_ser_read_f32(&t, &fv));       CHECK(fv == 1.5f);
+    CHECK_OK(dcf_ser_read_f64(&t, &dv));       CHECK(dv == 2.5);
+    CHECK_OK(dcf_ser_read_varint(&t, &uv));    CHECK(uv == 0);
+    CHECK_OK(dcf_ser_read_varint(&t, &uv));    CHECK(uv == 127);
+    CHECK_OK(dcf_ser_read_varint(&t, &uv));    CHECK(uv == 128);
+    CHECK_OK(dcf_ser_read_varint(&t, &uv));    CHECK(uv == UINT64_MAX);
+    CHECK_OK(dcf_ser_read_varsint(&t, &sv));
+    if (sv != INT64_MIN) {
+        fprintf(stderr, "FAIL: write_varsint(INT64_MIN) read back as %lld\n", (long long)sv);
+        return 1;
+    }
     dcf_ser_writer_destroy(&w);
     return 0;
 }
@@ -1600,6 +1625,534 @@ static int t_s10_legacy_crc_is_opt_in(void) {
 }
 
 /* ============================================================================
+ * Review round 2 (independent reviewer's findings N1..N9, I1)
+ * ============================================================================ */
+
+/* ---- N1: write_varsint lost the sign fill (pre-existing, wire-visible) ------------------ */
+
+/* The standard ZigZag vectors (protobuf / the library's own header comment): hard-coded,
+ * never derived from the library's formula. `bytes` are the LEB128 of the zigzag value. */
+static const struct { int64_t v; uint64_t zz; uint8_t bytes[10]; unsigned n; } zz_vectors[] = {
+    { 0,                       0,                      {0x00}, 1 },
+    { -1,                      1,                      {0x01}, 1 },
+    { 1,                       2,                      {0x02}, 1 },
+    { -2,                      3,                      {0x03}, 1 },
+    { 2,                       4,                      {0x04}, 1 },
+    { 63,                      126,                    {0x7E}, 1 },
+    { -64,                     127,                    {0x7F}, 1 },
+    { 64,                      128,                    {0x80, 0x01}, 2 },
+    { -65,                     129,                    {0x81, 0x01}, 2 },
+    { 2147483647,              4294967294ULL,          {0xFE, 0xFF, 0xFF, 0xFF, 0x0F}, 5 },
+    { -2147483647 - 1,         4294967295ULL,          {0xFF, 0xFF, 0xFF, 0xFF, 0x0F}, 5 },
+    { INT64_MAX,               UINT64_MAX - 1,         {0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01}, 10 },
+    { INT64_MIN,               UINT64_MAX,             {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01}, 10 },
+};
+
+static int t_n1_varsint_wire_vectors(void) {
+    for (size_t i = 0; i < sizeof zz_vectors / sizeof zz_vectors[0]; i++) {
+        DCFSerWriter w;
+        CHECK_OK(dcf_ser_writer_init(&w, 1, 0));
+        CHECK_OK(dcf_ser_write_varsint(&w, zz_vectors[i].v));
+        const uint8_t* d; size_t n;
+        CHECK_OK(dcf_ser_writer_finish(&w, &d, &n));
+        size_t want = 17 + 1 + zz_vectors[i].n + 4;
+        uint8_t expect[1 + 10];
+        expect[0] = 0x10;                                   /* VARINT tag */
+        memcpy(expect + 1, zz_vectors[i].bytes, zz_vectors[i].n);
+        if (n != want || memcmp(d + 17, expect, 1 + zz_vectors[i].n) != 0) {
+            fprintf(stderr, "FAIL: write_varsint(%lld) put %zu payload bytes on the wire (first: %02x %02x ...), "
+                    "zigzag value %llu = LEB128 of %u bytes expected\n", (long long)zz_vectors[i].v, n - 21,
+                    n > 17 ? d[17] : 0, n > 18 ? d[18] : 0, (unsigned long long)zz_vectors[i].zz, zz_vectors[i].n);
+            return 1;
+        }
+        dcf_ser_writer_destroy(&w);
+    }
+    return 0;
+}
+
+static int t_n1_varsint_reader_vectors(void) {
+    /* the READER decodes the standard vectors from hand-built frames (control: it was always right) */
+    for (size_t i = 0; i < sizeof zz_vectors / sizeof zz_vectors[0]; i++) {
+        uint8_t pl[1 + 10];
+        pl[0] = 0x10;
+        memcpy(pl + 1, zz_vectors[i].bytes, zz_vectors[i].n);
+        size_t flen;
+        uint8_t* f = okframe(pl, 1 + zz_vectors[i].n, &flen);
+        DCFSerReader r;
+        CHECK_OK(open_reader(&r, f, flen, 0));
+        int64_t out = 0x5555;
+        CHECK_OK(dcf_ser_read_varsint(&r, &out));
+        if (out != zz_vectors[i].v) {
+            fprintf(stderr, "FAIL: read_varsint of zigzag %llu gave %lld, want %lld\n",
+                    (unsigned long long)zz_vectors[i].zz, (long long)out, (long long)zz_vectors[i].v);
+            return 1;
+        }
+        free(f);
+    }
+    return 0;
+}
+
+static int t_n1_varsint_roundtrip_negative(void) {
+    static const int64_t vals[] = {0, 1, -1, 2, -2, 63, -64, 64, -65, 1000000, -1000000, 2147483647LL,
+                                   -2147483648LL, 4294967296LL, -4294967296LL, INT64_MAX, INT64_MIN,
+                                   INT64_MIN + 1, INT64_MAX - 1};
+    for (size_t i = 0; i < sizeof vals / sizeof vals[0]; i++) {
+        DCFSerWriter w;
+        CHECK_OK(dcf_ser_writer_init(&w, 1, 0));
+        CHECK_OK(dcf_ser_write_varsint(&w, vals[i]));
+        const uint8_t* d; size_t n;
+        CHECK_OK(dcf_ser_writer_finish(&w, &d, &n));
+        DCFSerReader r;
+        CHECK_OK(dcf_ser_reader_init(&r, d, n));
+        CHECK_OK(dcf_ser_reader_validate(&r));
+        int64_t out = 0x7777;
+        CHECK_OK(dcf_ser_read_varsint(&r, &out));
+        if (out != vals[i]) {
+            fprintf(stderr, "FAIL: write_varsint(%lld) reads back as %lld\n", (long long)vals[i], (long long)out);
+            return 1;
+        }
+        dcf_ser_writer_destroy(&w);
+    }
+    return 0;
+}
+
+/* ---- N2: the schema reader scanned the whole schema for every wire field ----------------- */
+
+static double cpu_seconds(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+
+/* A struct of `nf` unknown 4-byte fields (id 0xFFFF, type NULL, value NULL) against a schema of
+ * `nsch` fields; returns the best of three CPU times of dcf_ser_read_struct_schema. */
+static double schema_scan_cpu(const uint8_t* frame, size_t flen, const DCFSerSchema* sc, void* target, DCFSerError* e_out) {
+    double best = 1e9;
+    for (int rep = 0; rep < 3; rep++) {
+        DCFSerReader r;
+        if (open_reader(&r, frame, flen, 0) != DCF_SER_OK) { *e_out = DCF_SER_ERR_INTERNAL; return 0; }
+        double t0 = cpu_seconds();
+        *e_out = dcf_ser_read_struct_schema(&r, target, sc);
+        double dt = cpu_seconds() - t0;
+        if (dt < best) best = dt;
+    }
+    return best;
+}
+
+static int t_n2_schema_lookup_not_linear(void) {
+    enum { NF = 1000000 };
+    Buf pl = {0};
+    b8(&pl, 0x22); b16(&pl, 0x42);
+    for (unsigned i = 0; i < NF; i++) { b16(&pl, 0xFFFF); b8(&pl, 0x00); b8(&pl, 0x00); }
+    b16(&pl, 0); b8(&pl, 0);
+    size_t flen;
+    uint8_t* f = okframe(pl.p, pl.n, &flen);
+    static DCFSerField big[256], one[1];
+    static uint8_t target[256];
+    for (unsigned i = 0; i < 256; i++) {
+        big[i].name = "f"; big[i].field_id = (uint16_t)(i + 1); big[i].type = DCF_TYPE_U8;
+        big[i].flags = 0; big[i].offset = i; big[i].size = 1;
+    }
+    one[0] = big[0];
+    DCFSerSchema s256 = { "B", 0x42, big, 256, sizeof target };
+    DCFSerSchema s1 = { "B", 0x42, one, 1, sizeof target };
+    DCFSerError e1, e256;
+    double t1 = schema_scan_cpu(f, flen, &s1, target, &e1);
+    double t256 = schema_scan_cpu(f, flen, &s256, target, &e256);
+    CHECK_OK(e1);
+    CHECK_OK(e256);
+    fprintf(stderr, "info: %d unknown fields: 1-field schema %.1f ms, 256-field schema %.1f ms (ratio %.2f)\n",
+            NF, t1 * 1e3, t256 * 1e3, t256 / t1);
+    /* a linear scan of 256 ids per wire field costs several times the 1-field case; an indexed lookup
+     * (8 probes) stays within a small factor of it */
+    if (t256 > 2.5 * t1) {
+        fprintf(stderr, "FAIL: a 256-field schema costs %.2fx a 1-field schema per unknown wire field "
+                "(%.1f ms vs %.1f ms): the id lookup is not O(log n)\n", t256 / t1, t256 * 1e3, t1 * 1e3);
+        return 1;
+    }
+    return 0;
+}
+
+/* schema semantics the lookup must keep: first duplicate id in the SCHEMA wins, ids anywhere in 0..65535 */
+static int t_n2_schema_lookup_semantics(void) {
+    static const DCFSerField fl[] = {
+        { "z", 65535, DCF_TYPE_U8, DCF_FIELD_OPTIONAL, 0, 1 },
+        { "a", 7,     DCF_TYPE_U8, DCF_FIELD_OPTIONAL, 1, 1 },
+        { "b", 7,     DCF_TYPE_U8, DCF_FIELD_OPTIONAL, 2, 1 },      /* duplicate id in the schema: the first one wins */
+        { "c", 300,   DCF_TYPE_U8, DCF_FIELD_OPTIONAL, 3, 1 },
+        { "d", 0,     DCF_TYPE_U8, DCF_FIELD_OPTIONAL, 4, 1 },      /* id 0 with type U8 is an ordinary field */
+        { "e", 256,   DCF_TYPE_U8, DCF_FIELD_OPTIONAL, 5, 1 },
+    };
+    static const DCFSerSchema sc = { "S", 0x55, fl, 6, 6 };
+    DCFSerWriter w;
+    CHECK_OK(dcf_ser_writer_init(&w, 3, 0));
+    CHECK_OK(dcf_ser_write_struct_begin(&w, 0x55));
+    static const uint16_t ids[] = {300, 7, 65535, 0, 256, 9999};
+    for (unsigned i = 0; i < 6; i++) {
+        CHECK_OK(dcf_ser_write_field(&w, ids[i], DCF_TYPE_U8));
+        CHECK_OK(dcf_ser_write_u8(&w, (uint8_t)(10 + i)));
+    }
+    CHECK_OK(dcf_ser_write_struct_end(&w));
+    const uint8_t* d; size_t n;
+    CHECK_OK(dcf_ser_writer_finish(&w, &d, &n));
+    DCFSerReader r;
+    CHECK_OK(open_reader(&r, d, n, 0));
+    uint8_t out[6] = {0};
+    CHECK_OK(dcf_ser_read_struct_schema(&r, out, &sc));
+    CHECK_EQ(out[3], 10);      /* id 300 */
+    CHECK_EQ(out[1], 11);      /* id 7 -> the FIRST schema entry "a", not "b" */
+    CHECK_EQ(out[2], 0);
+    CHECK_EQ(out[0], 12);      /* id 65535 */
+    CHECK_EQ(out[4], 13);      /* id 0 */
+    CHECK_EQ(out[5], 14);      /* id 256 */
+    dcf_ser_writer_destroy(&w);
+    return 0;
+}
+
+/* ---- N6: reader->depth leaks ---------------------------------------------------------------- */
+
+static int t_n6_validate_resets_depth(void) {
+    /* open DCF_SER_MAX_DEPTH containers on a frame of nested arrays ... */
+    Buf pl = {0};
+    for (int i = 0; i < DCF_SER_MAX_DEPTH; i++) { b8(&pl, 0x20); b8(&pl, 0x20); b32(&pl, 1); }
+    b8(&pl, 0x00);
+    size_t flen;
+    uint8_t* f = okframe(pl.p, pl.n, &flen);
+    DCFSerReader r;
+    CHECK_OK(open_reader(&r, f, flen, 0));
+    DCFSerType t; size_t c;
+    for (int i = 0; i < DCF_SER_MAX_DEPTH; i++) CHECK_OK(dcf_ser_read_array_begin(&r, &t, &c));
+    CHECK_EQ(r.depth, DCF_SER_MAX_DEPTH);
+    /* ... then point the same reader at a fresh, flat frame WITHOUT reader_init */
+    Buf q = {0};
+    b8(&q, 0x20); b8(&q, 0x06); b32(&q, 1); b8(&q, 0x06); b32(&q, 5);
+    size_t glen;
+    uint8_t* g = okframe(q.p, q.n, &glen);
+    r.buffer = g; r.length = glen;
+    CHECK_OK(dcf_ser_reader_validate(&r));
+    if (r.depth != 0) {
+        fprintf(stderr, "FAIL: validate() left reader->depth = %zu from the previous frame\n", r.depth);
+        return 1;
+    }
+    CHECK_OK(dcf_ser_read_array_begin(&r, &t, &c));
+    return 0;
+}
+
+static int t_n6_failed_schema_read_leaves_reader_unchanged(void) {
+    /* 40 sibling structs whose type_id differs from the consumer's schema: "read schema, on error skip" */
+    enum { SIBLINGS = 40 };
+    Buf pl = {0};
+    for (int i = 0; i < SIBLINGS; i++) { b8(&pl, 0x22); b16(&pl, 0x0999); b16(&pl, 1); b8(&pl, 0x02); b8(&pl, 0x02); b8(&pl, (unsigned)i); b16(&pl, 0); b8(&pl, 0); }
+    size_t flen;
+    uint8_t* f = okframe(pl.p, pl.n, &flen);
+    static const DCFSerField fl[] = { { "a", 1, DCF_TYPE_U8, DCF_FIELD_OPTIONAL, 0, 1 } };
+    static const DCFSerSchema sc = { "S", 0x0123, fl, 1, 1 };
+    DCFSerReader r;
+    CHECK_OK(open_reader(&r, f, flen, 0));
+    int skipped = 0;
+    while (!dcf_ser_reader_at_end(&r)) {
+        size_t pos0 = r.position, depth0 = r.depth;
+        uint8_t out = 0xAA;
+        DCFSerError e = dcf_ser_read_struct_schema(&r, &out, &sc);
+        if (e != DCF_SER_ERR_TYPE_MISMATCH) { fprintf(stderr, "FAIL: schema read of a foreign struct gave 0x%x\n", e); return 1; }
+        if (r.depth != depth0) { fprintf(stderr, "FAIL: failed schema read left depth %zu -> %zu (sibling %d)\n", depth0, r.depth, skipped); return 1; }
+        if (r.position != pos0) { fprintf(stderr, "FAIL: failed schema read moved position %zu -> %zu (sibling %d)\n", pos0, r.position, skipped); return 1; }
+        e = dcf_ser_reader_skip(&r);
+        if (e != DCF_SER_OK) { fprintf(stderr, "FAIL: skip of sibling %d failed with 0x%x\n", skipped, e); return 1; }
+        skipped++;
+    }
+    CHECK_EQ(skipped, SIBLINGS);
+    return 0;
+}
+
+static int t_n6_failed_schema_read_other_errors(void) {
+    /* required field missing, duplicate id, truncated field: depth and position restored every time */
+    static const DCFSerField fl[] = { { "a", 1, DCF_TYPE_U8, DCF_FIELD_REQUIRED, 0, 1 } };
+    static const DCFSerSchema sc = { "S", 0x0123, fl, 1, 1 };
+    for (int variant = 0; variant < 3; variant++) {
+        Buf pl = {0};
+        b8(&pl, 0x22); b16(&pl, 0x0123);
+        if (variant == 1) { b16(&pl, 1); b8(&pl, 2); b8(&pl, 2); b8(&pl, 5); b16(&pl, 1); b8(&pl, 2); b8(&pl, 2); b8(&pl, 6); }
+        if (variant == 2) { b16(&pl, 1); b8(&pl, 2); b8(&pl, 4); b16(&pl, 9); }       /* U16 value where U8 was due */
+        b16(&pl, 0); b8(&pl, 0);
+        size_t flen;
+        uint8_t* f = okframe(pl.p, pl.n, &flen);
+        DCFSerReader r;
+        CHECK_OK(open_reader(&r, f, flen, 0));
+        uint8_t out = 0;
+        CHECK_ERR(dcf_ser_read_struct_schema(&r, &out, &sc));
+        CHECK_EQ(r.depth, 0);
+        CHECK_EQ(r.position, 17);
+        CHECK_OK(dcf_ser_reader_skip(&r));                    /* the whole struct is still there to skip */
+        CHECK(dcf_ser_reader_at_end(&r));
+        free(f);
+    }
+    return 0;
+}
+
+/* ---- N4: len-0 raw reads on a reader whose init failed -------------------------------------- */
+
+static int t_n4_read_raw_zero_on_failed_init(void) {
+    DCFSerReader r;
+    uint8_t few[5] = {0};
+    CHECK_ERR(dcf_ser_reader_init(&r, few, sizeof few));        /* too short: refused, reader left zeroed */
+    uint8_t out[1];
+    const void* p = (const void*)0x1;
+    CHECK_ERR(dcf_ser_read_raw(&r, out, 0));                    /* memcpy(out, NULL, 0) is undefined behaviour */
+    CHECK_ERR(dcf_ser_read_raw_ptr(&r, &p, 0));
+    CHECK(p == (const void*)0x1);                               /* *out_ptr untouched on error */
+    /* a validated reader still allows a zero-length raw read */
+    Buf b = {0};
+    b8(&b, 0x00);
+    size_t flen;
+    uint8_t* f = okframe(b.p, b.n, &flen);
+    DCFSerReader ok;
+    CHECK_OK(open_reader(&ok, f, flen, 0));
+    CHECK_OK(dcf_ser_read_raw(&ok, out, 0));
+    CHECK_OK(dcf_ser_read_raw_ptr(&ok, &p, 0));
+    CHECK(p != NULL);
+    return 0;
+}
+
+/* ---- N5: a failed typed read must not move the reader ---------------------------------------- */
+
+static int t_n5_typed_reads_are_atomic(void) {
+    /* U16(0x1234), then a string whose body is invalid UTF-8, then a U32 with a short body (UNSTRUCTURED) */
+    Buf pl = {0};
+    b8(&pl, 0x04); b16(&pl, 0x1234);
+    b8(&pl, 0x11); b32(&pl, 2); b8(&pl, 0xC0); b8(&pl, 0x80);
+    b8(&pl, 0x06); b8(&pl, 0x01); b8(&pl, 0x02);
+    size_t flen;
+    uint8_t* f = okframe(pl.p, pl.n, &flen);
+    DCFSerReader r;
+    CHECK_OK(open_reader(&r, f, flen, POL_RAW));
+    size_t at = r.position;
+    uint8_t u8; uint32_t u32; const char* s; size_t sl; char sbuf[8]; uint64_t u64;
+    /* type mismatch: read_u8 on a U16 */
+    CHECK_EQ(dcf_ser_read_u8(&r, &u8), DCF_SER_ERR_TYPE_MISMATCH);
+    if (r.position != at) { fprintf(stderr, "FAIL: read_u8 on a U16 moved the reader %zu -> %zu\n", at, r.position); return 1; }
+    CHECK_EQ(dcf_ser_reader_peek_type(&r), DCF_TYPE_U16);
+    CHECK_EQ(dcf_ser_read_varint(&r, &u64), DCF_SER_ERR_TYPE_MISMATCH);
+    CHECK_EQ(r.position, at);
+    uint16_t u16;
+    CHECK_OK(dcf_ser_read_u16(&r, &u16));
+    CHECK_EQ(u16, 0x1234);
+    /* invalid UTF-8 string: refused, not consumed; copy API too */
+    at = r.position;
+    CHECK_ERR(dcf_ser_read_string(&r, &s, &sl));
+    CHECK_EQ(r.position, at);
+    CHECK_ERR(dcf_ser_read_string_copy(&r, sbuf, sizeof sbuf, &sl));
+    CHECK_EQ(r.position, at);
+    CHECK_EQ(dcf_ser_reader_peek_type(&r), DCF_TYPE_STRING);
+    /* ... the application decides to take it as BYTES-like: raw skip of the 7 bytes, to reach the U32 */
+    const void* rp;
+    CHECK_OK(dcf_ser_read_raw_ptr(&r, &rp, 1 + 4 + 2));
+    /* U32 with only 2 body bytes: TRUNCATED, nothing consumed */
+    at = r.position;
+    CHECK_EQ(dcf_ser_read_u32(&r, &u32), DCF_SER_ERR_TRUNCATED);
+    CHECK_EQ(r.position, at);
+    CHECK_EQ(dcf_ser_reader_peek_type(&r), DCF_TYPE_U32);
+
+    /* a too-small copy buffer reports OVERFLOW and consumes nothing, so the caller can retry */
+    Buf q = {0};
+    b8(&q, 0x11); b32(&q, 5); bput(&q, "hello", 5);
+    b8(&q, 0x12); b32(&q, 3); bput(&q, "abc", 3);
+    size_t glen;
+    uint8_t* g = okframe(q.p, q.n, &glen);
+    DCFSerReader r2;
+    CHECK_OK(open_reader(&r2, g, glen, 0));
+    size_t need = 0;
+    CHECK_EQ(dcf_ser_read_string_copy(&r2, sbuf, 3, &need), DCF_SER_ERR_OVERFLOW);
+    CHECK_EQ(need, 5);
+    CHECK_EQ(r2.position, 17);
+    CHECK_OK(dcf_ser_read_string_copy(&r2, sbuf, sizeof sbuf, &need));
+    CHECK(need == 5 && memcmp(sbuf, "hello", 6) == 0);
+    uint8_t bbuf[2];
+    size_t bpos = r2.position;
+    CHECK_EQ(dcf_ser_read_bytes_copy(&r2, bbuf, sizeof bbuf, &need), DCF_SER_ERR_OVERFLOW);
+    CHECK_EQ(need, 3);
+    CHECK_EQ(r2.position, bpos);
+
+    /* container headers: a refused array_begin consumes nothing and leaves depth alone */
+    Buf z = {0};
+    b8(&z, 0x20); b8(&z, 0x00); b32(&z, 0xFFFFFFFFu);
+    size_t zlen;
+    uint8_t* zf = okframe(z.p, z.n, &zlen);
+    DCFSerReader r3;
+    CHECK_OK(open_reader(&r3, zf, zlen, POL_RAW));
+    DCFSerType et; size_t cnt;
+    CHECK_ERR(dcf_ser_read_array_begin(&r3, &et, &cnt));
+    CHECK_EQ(r3.position, 17);
+    CHECK_EQ(r3.depth, 0);
+    return 0;
+}
+
+/* ---- N7: the writer must not accept flag bits the reader can never accept -------------------- */
+
+static int t_n7_writer_rejects_never_allowed_flags(void) {
+    static const uint8_t bad[] = {0x40, 0x80, 0xC0, 0x41, 0xA0, 0xFF};
+    for (size_t i = 0; i < sizeof bad; i++) {
+        DCFSerWriter w;
+        DCFSerError e = dcf_ser_writer_init(&w, 1, bad[i]);
+        if (e == DCF_SER_OK) { fprintf(stderr, "FAIL: writer_init accepted flags 0x%02x\n", bad[i]); return 1; }
+        CHECK_EQ(e, DCF_SER_ERR_INVALID_ARG);
+        uint8_t buf[64];
+        DCFSerWriter w2;
+        CHECK_EQ(dcf_ser_writer_init_buffer(&w2, buf, sizeof buf, 1, bad[i]), DCF_SER_ERR_INVALID_ARG);
+    }
+    /* every other flag combination is still accepted by the writer (policy is the reader's business) */
+    for (unsigned fl = 0; fl < 0x40; fl++) {
+        DCFSerWriter w;
+        CHECK_OK(dcf_ser_writer_init(&w, 1, (uint8_t)fl));
+        dcf_ser_writer_destroy(&w);
+    }
+    /* reset() has no return value: bad flags make the writer fail closed instead */
+    DCFSerWriter w;
+    CHECK_OK(dcf_ser_writer_init(&w, 1, 0));
+    dcf_ser_writer_reset(&w, 1, 0x80);
+    const uint8_t* d; size_t n;
+    CHECK_ERR(dcf_ser_write_u8(&w, 1));
+    CHECK_ERR(dcf_ser_writer_finish(&w, &d, &n));
+    dcf_ser_writer_reset(&w, 1, 0x00);                          /* and a good reset recovers it */
+    CHECK_OK(dcf_ser_write_u8(&w, 1));
+    CHECK_OK(dcf_ser_writer_finish(&w, &d, &n));
+    dcf_ser_writer_destroy(&w);
+    return 0;
+}
+
+/* The writer is not a grammar enforcer. Each row of the README's "writer/reader asymmetries"
+ * table is checked here so the table cannot rot. */
+static int t_n7_documented_asymmetries(void) {
+    const uint8_t* d; size_t n;
+    DCFSerWriter w;
+    /* 1. array count larger than the elements written */
+    CHECK_OK(dcf_ser_writer_init(&w, 1, 0));
+    CHECK_OK(dcf_ser_write_array_begin(&w, DCF_TYPE_U8, 3));
+    CHECK_OK(dcf_ser_write_u8(&w, 1)); CHECK_OK(dcf_ser_write_array_end(&w));
+    CHECK_OK(dcf_ser_writer_finish(&w, &d, &n));
+    CHECK_ERR(dcf_ser_validate_message(d, n));
+    dcf_ser_writer_destroy(&w);
+    /* 2. map count larger than the entries written */
+    CHECK_OK(dcf_ser_writer_init(&w, 1, 0));
+    CHECK_OK(dcf_ser_write_map_begin(&w, DCF_TYPE_U8, DCF_TYPE_U8, 2));
+    CHECK_OK(dcf_ser_write_u8(&w, 1)); CHECK_OK(dcf_ser_write_u8(&w, 2)); CHECK_OK(dcf_ser_write_map_end(&w));
+    CHECK_OK(dcf_ser_writer_finish(&w, &d, &n));
+    CHECK_ERR(dcf_ser_validate_message(d, n));
+    dcf_ser_writer_destroy(&w);
+    /* 3. struct_begin without struct_end */
+    CHECK_OK(dcf_ser_writer_init(&w, 1, 0));
+    CHECK_OK(dcf_ser_write_struct_begin(&w, 1));
+    CHECK_OK(dcf_ser_writer_finish(&w, &d, &n));
+    CHECK_ERR(dcf_ser_validate_message(d, n));
+    dcf_ser_writer_destroy(&w);
+    /* 4. write_field with id 0 and type NULL is the end marker: the struct ends early and the
+     *    value after it is a stray top-level value (here a truncated string header) */
+    CHECK_OK(dcf_ser_writer_init(&w, 1, 0));
+    CHECK_OK(dcf_ser_write_struct_begin(&w, 1));
+    CHECK_OK(dcf_ser_write_field(&w, 0, DCF_TYPE_NULL));
+    CHECK_OK(dcf_ser_write_field(&w, 0x1100, DCF_TYPE_U8));      /* bytes 11 00 02: a STRING tag, short */
+    CHECK_OK(dcf_ser_write_struct_end(&w));
+    CHECK_OK(dcf_ser_writer_finish(&w, &d, &n));
+    CHECK_ERR(dcf_ser_validate_message(d, n));
+    dcf_ser_writer_destroy(&w);
+    /* 5. raw bytes are not tagged values */
+    CHECK_OK(dcf_ser_writer_init(&w, 1, 0));
+    CHECK_OK(dcf_ser_write_raw(&w, "\xFF\xFF", 2));
+    CHECK_OK(dcf_ser_writer_finish(&w, &d, &n));
+    CHECK_ERR(dcf_ser_validate_message(d, n));
+    { DCFSerReader r; CHECK_OK(dcf_ser_reader_init(&r, d, n)); CHECK_OK(dcf_ser_reader_set_policy(&r, DCF_SER_POLICY_ALLOW_UNSTRUCTURED)); CHECK_OK(dcf_ser_reader_validate(&r)); }
+    dcf_ser_writer_destroy(&w);
+    /* 6. NO_CRC / COMPRESSED / ENCRYPTED are policy, not grammar: written fine, refused by default */
+    static const uint8_t pol_flags[] = {DCF_SER_FLAG_NO_CRC, DCF_SER_FLAG_COMPRESSED, DCF_SER_FLAG_ENCRYPTED};
+    for (size_t i = 0; i < sizeof pol_flags; i++) {
+        CHECK_OK(dcf_ser_writer_init(&w, 1, pol_flags[i]));
+        CHECK_OK(dcf_ser_write_u8(&w, 1));
+        CHECK_OK(dcf_ser_writer_finish(&w, &d, &n));
+        CHECK_EQ(dcf_ser_validate_message(d, n), ERR_POLICY);
+        dcf_ser_writer_destroy(&w);
+    }
+    /* 7. a field header type that differs from the value's tag: the grammar does not relate them,
+     *    schema reads do (TYPE_MISMATCH) */
+    CHECK_OK(dcf_ser_writer_init(&w, 1, 0));
+    CHECK_OK(dcf_ser_write_struct_begin(&w, 0x300));
+    CHECK_OK(dcf_ser_write_field(&w, 1, DCF_TYPE_U8));
+    CHECK_OK(dcf_ser_write_u32(&w, 5));
+    CHECK_OK(dcf_ser_write_struct_end(&w));
+    CHECK_OK(dcf_ser_writer_finish(&w, &d, &n));
+    CHECK_OK(dcf_ser_validate_message(d, n));
+    { DCFSerReader r; Pair p; CHECK_OK(open_reader(&r, d, n, 0)); CHECK_ERR(dcf_ser_read_struct_schema(&r, &p, &pair_schema)); }
+    dcf_ser_writer_destroy(&w);
+    return 0;
+}
+
+/* ---- N8: a schema refused up front leaves the caller's struct untouched ---------------------- */
+
+static int t_n8_refused_schema_leaves_struct_untouched(void) {
+    Named out;
+    memset(&out, 0xAA, sizeof out);
+    Buf pl = {0};
+    b8(&pl, 0x22); b16(&pl, 0x301); b16(&pl, 0); b8(&pl, 0);
+    size_t flen;
+    uint8_t* f = okframe(pl.p, pl.n, &flen);
+    DCFSerReader r;
+    CHECK_OK(open_reader(&r, f, flen, 0));
+    CHECK_EQ(dcf_ser_read_struct_schema(&r, &out, &named_schema), DCF_SER_ERR_INVALID_TYPE);   /* STRING field */
+    uint8_t* bytes = (uint8_t*)&out;
+    for (size_t i = 0; i < sizeof out; i++) CHECK_EQ(bytes[i], 0xAA);                          /* untouched, NOT zeroed */
+    CHECK_EQ(r.position, 17);
+    /* whereas a wire-driven error zeroes it */
+    static const DCFSerField fl[] = { { "a", 1, DCF_TYPE_U8, DCF_FIELD_REQUIRED, 0, 1 } };
+    static const DCFSerSchema sc = { "S", 0x301, fl, 1, 1 };
+    uint8_t one = 0xAA;
+    CHECK_ERR(dcf_ser_read_struct_schema(&r, &one, &sc));       /* REQUIRED a is absent */
+    CHECK_EQ(one, 0);
+    return 0;
+}
+
+/* ---- I1: ALLOW_LEGACY_CRC is not "either CRC, nothing else" ---------------------------------- */
+
+static int t_i1_legacy_crc_one_bit_blind_spot(void) {
+#ifdef DCF_SER_POLICY_ALLOW_LEGACY_CRC
+    /* 0xCDD706B3 ^ 0xCDD70693 == 0x20 and CRC is linear, so for a frame with exactly ONE lookup of
+     * table entry 245, at byte j, legacy_crc(F') == std_crc(F) where F' is F with bit 5 of byte j+1
+     * flipped. A standard-CRC frame corrupted in exactly that bit is therefore accepted as "legacy"
+     * under the flag. The README says so; this test pins it down so the sentence cannot rot. */
+    uint32_t tbl[256];
+    for (uint32_t t = 0; t < 256; t++) { uint32_t c = t; for (int k = 0; k < 8; k++) c = (c & 1) ? (c >> 1) ^ 0xEDB88320u : c >> 1; tbl[t] = c; }
+    uint64_t x = 0x1234567ULL;
+    for (int attempt = 0; attempt < 20000; attempt++) {
+        uint8_t body[24];
+        for (unsigned i = 0; i < sizeof body; i++) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; body[i] = (uint8_t)x; }
+        Buf pl = {0};
+        b8(&pl, 0x12); b32(&pl, sizeof body); bput(&pl, body, sizeof body);       /* BYTES: the body is free */
+        size_t flen;
+        uint8_t* f = okframe(pl.p, pl.n, &flen);
+        free(pl.p);
+        uint32_t crc = 0xFFFFFFFFu;
+        unsigned hits = 0;
+        size_t hit = 0;
+        for (size_t i = 0; i < flen - 4; i++) {
+            uint32_t idx = (crc ^ f[i]) & 0xFF;
+            if (idx == 245) { hits++; hit = i; }
+            crc = tbl[idx] ^ (crc >> 8);
+        }
+        if (hits != 1 || hit < 22 || hit + 1 >= flen - 4 - 1) { free(f); continue; }   /* want the hit and the next byte inside the body */
+        f[hit + 1] ^= 0x20;
+        DCFSerReader r;
+        CHECK_EQ(open_reader(&r, f, flen, 0), DCF_SER_ERR_CRC_MISMATCH);                         /* strict: caught */
+        CHECK_OK(open_reader(&r, f, flen, DCF_SER_POLICY_ALLOW_LEGACY_CRC));                      /* legacy flag: accepted */
+        free(f);
+        return 0;
+    }
+    fprintf(stderr, "FAIL: no suitable frame found\n");
+    return 1;
+#else
+    fprintf(stderr, "FAIL: API absent\n");
+    return 1;
+#endif
+}
+
+/* ============================================================================
  * Runner
  * ============================================================================ */
 
@@ -1670,6 +2223,20 @@ static const TestCase tests[] = {
     T(t_s9_validate_payload_agrees_with_typed_reads, "S8"),
     T(t_s10_crc32_is_standard, "S10"),
     T(t_s10_legacy_crc_is_opt_in, "S10"),
+    T(t_n1_varsint_wire_vectors, "N1"),
+    T(t_n1_varsint_reader_vectors, "N1 control"),
+    T(t_n1_varsint_roundtrip_negative, "N1"),
+    T(t_n2_schema_lookup_not_linear, "N2"),
+    T(t_n2_schema_lookup_semantics, "N2 control"),
+    T(t_n6_validate_resets_depth, "N6"),
+    T(t_n6_failed_schema_read_leaves_reader_unchanged, "N6"),
+    T(t_n6_failed_schema_read_other_errors, "N6"),
+    T(t_n4_read_raw_zero_on_failed_init, "N4"),
+    T(t_n5_typed_reads_are_atomic, "N5"),
+    T(t_n7_writer_rejects_never_allowed_flags, "N7"),
+    T(t_n7_documented_asymmetries, "N7"),
+    T(t_n8_refused_schema_leaves_struct_untouched, "N8"),
+    T(t_i1_legacy_crc_one_bit_blind_spot, "I1"),
 };
 
 static const char* first_interesting(const char* log) {

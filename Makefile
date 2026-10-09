@@ -88,7 +88,7 @@ endif
 DOCKER_IMAGE := dcf-serialize
 DOCKER_TAG   := $(VERSION)
 
-.PHONY: all clean install uninstall test bench memcheck fuzz check-gate docker docker-load docker-push help
+.PHONY: all clean install uninstall test interop bench memcheck fuzz check-gate docker docker-load docker-push help
 
 # Default target
 all: $(STATIC_LIB) $(SHARED_LIB) $(TEST_BINS)
@@ -142,6 +142,13 @@ ifneq ($(GATE),0)
 	LD_LIBRARY_PATH=. ./$(DIFF_BIN)
 	./$(GUARD_BIN)
 endif
+
+# The writer's ZigZag / LEB128 / CRC-32 against an independent decoder (Python, zlib) and the
+# standard ZigZag vectors. Needs python3.
+interop: $(STATIC_LIB) $(HDRS) scripts/varsint_emit.c scripts/varsint_interop.py
+	$(CC) $(CFLAGS) scripts/varsint_emit.c $(STATIC_LIB) -o varsint_emit $(LDFLAGS)
+	./varsint_emit | python3 scripts/varsint_interop.py
+	@rm -f varsint_emit
 
 # Cost of the gate next to the C validator (one machine, one run: re-measure, do not quote)
 bench: $(STATIC_LIB) $(HDRS) gate/dcfs_gate_bench.c

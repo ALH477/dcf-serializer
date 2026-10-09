@@ -9,6 +9,7 @@ dcf_serialize_fuzz
 dcfs_gate_diff_test
 dcfs_gate_guard_test
 dcfs_gate_bench
+varsint_emit
 fuzz-corpus/
 result
 *.gcov
