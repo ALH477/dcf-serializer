@@ -20,7 +20,7 @@ LDFLAGS     ?=
 
 # Debug build
 ifdef DEBUG
-  CFLAGS    += -g -O0 -DDEBUG -fsanitize=address,undefined
+  CFLAGS    += -g -O0 -DDEBUG -fsanitize=address,undefined -fno-sanitize-recover=all
   LDFLAGS   += -fsanitize=address,undefined
 endif
 
@@ -28,6 +28,7 @@ endif
 SRCS        := dcf_serialize.c
 HDRS        := dcf_serialize.h
 TEST_SRCS   := dcf_serialize_test.c
+HOSTILE_SRCS:= dcf_serialize_hostile_test.c
 OBJS        := $(SRCS:.c=.o)
 
 # Output files
@@ -35,6 +36,7 @@ STATIC_LIB  := libdcf_serialize.a
 SHARED_LIB  := libdcf_serialize.so.$(VERSION)
 SHARED_LINK := libdcf_serialize.so
 TEST_BIN    := dcf_serialize_test
+HOSTILE_BIN := dcf_serialize_hostile_test
 
 # Docker settings
 DOCKER_IMAGE := dcf-serialize
@@ -43,7 +45,7 @@ DOCKER_TAG   := $(VERSION)
 .PHONY: all clean install uninstall test docker docker-load docker-push help
 
 # Default target
-all: $(STATIC_LIB) $(SHARED_LIB) $(TEST_BIN)
+all: $(STATIC_LIB) $(SHARED_LIB) $(TEST_BIN) $(HOSTILE_BIN)
 
 # Static library
 $(STATIC_LIB): $(OBJS)
@@ -62,12 +64,17 @@ $(SHARED_LIB): $(SRCS) $(HDRS)
 $(TEST_BIN): $(TEST_SRCS) $(STATIC_LIB) $(HDRS)
 	$(CC) $(CFLAGS) $(TEST_SRCS) -L. -ldcf_serialize -o $@ $(LDFLAGS)
 
+# Hostile-input regression suite (one forked child per test)
+$(HOSTILE_BIN): $(HOSTILE_SRCS) $(STATIC_LIB) $(HDRS)
+	$(CC) $(CFLAGS) $(HOSTILE_SRCS) -L. -ldcf_serialize -o $@ $(LDFLAGS)
+
 # Run tests
-test: $(TEST_BIN)
+test: $(TEST_BIN) $(HOSTILE_BIN)
 	@echo "╔═══════════════════════════════════════════════════╗"
 	@echo "║  Running DCF Serialize Tests                      ║"
 	@echo "╚═══════════════════════════════════════════════════╝"
 	LD_LIBRARY_PATH=. ./$(TEST_BIN)
+	LD_LIBRARY_PATH=. ./$(HOSTILE_BIN)
 
 # Memory check with valgrind
 memcheck: $(TEST_BIN)
@@ -114,7 +121,7 @@ uninstall:
 
 # Clean
 clean:
-	rm -f $(OBJS) $(STATIC_LIB) $(SHARED_LIB) $(SHARED_LINK) $(TEST_BIN)
+	rm -f $(OBJS) $(STATIC_LIB) $(SHARED_LIB) $(SHARED_LINK) $(TEST_BIN) $(HOSTILE_BIN)
 	rm -f *.gcov *.gcda *.gcno
 
 # Build Docker image via Nix
