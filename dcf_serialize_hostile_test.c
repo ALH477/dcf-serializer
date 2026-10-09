@@ -1518,6 +1518,91 @@ static int t_s9_validate_payload_agrees_with_typed_reads(void) {
 }
 
 /* ============================================================================
+ * S10 - found by the C-vs-gate differential: crc32_table[245] was mistyped
+ * ============================================================================ */
+
+/* Bitwise CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320): independent of the
+ * library's table. `legacy` reproduces the old table entry 245. */
+static uint32_t ref_crc32(const uint8_t* p, size_t n, int legacy) {
+    uint32_t tbl[256];
+    for (uint32_t t = 0; t < 256; t++) {
+        uint32_t c = t;
+        for (int k = 0; k < 8; k++) c = (c & 1) ? (c >> 1) ^ 0xEDB88320u : c >> 1;
+        tbl[t] = c;
+    }
+    if (legacy) tbl[245] = 0xCDD706B3u;
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) crc = tbl[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFu;
+}
+
+static int t_s10_crc32_is_standard(void) {
+    /* external vectors (Python zlib.crc32). A first byte of 0x0A looks up table entry
+     * 0xFF ^ 0x0A = 245, the entry that was mistyped. */
+    const uint8_t nl = 0x0A;
+    if (dcf_ser_crc32(&nl, 1) != 0x32d70693u) {
+        fprintf(stderr, "FAIL: crc32 of the single byte 0A is 0x%08x, standard CRC-32 is 0x32d70693\n",
+                dcf_ser_crc32(&nl, 1));
+        return 1;
+    }
+    const uint8_t v3[3] = {0x00, 0xF5, 0x01};
+    CHECK_EQ(dcf_ser_crc32(v3, 3), 0xe18dfc7cu);
+    uint8_t all[256];
+    for (unsigned i = 0; i < 256; i++) all[i] = (uint8_t)i;
+    CHECK_EQ(dcf_ser_crc32(all, 256), 0x29058c73u);
+    CHECK_EQ(dcf_ser_crc32("123456789", 9), 0xCBF43926u);
+    CHECK_EQ(dcf_ser_crc32("", 0), 0u);
+    /* and against the bitwise reference on varied input */
+    uint64_t x = 88172645463325252ULL;
+    for (int round = 0; round < 3000; round++) {
+        uint8_t buf[300];
+        size_t n = (size_t)(round % 300);
+        for (size_t i = 0; i < n; i++) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; buf[i] = (uint8_t)x; }
+        if (dcf_ser_crc32(buf, n) != ref_crc32(buf, n, 0)) {
+            fprintf(stderr, "FAIL: crc32 differs from the bitwise reference at round %d (n=%zu)\n", round, n);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* The deployed fleet computed the mistyped CRC. The reader can still accept it
+ * for a migration window, but only when told to. */
+static int t_s10_legacy_crc_is_opt_in(void) {
+#ifdef DCF_SER_POLICY_ALLOW_LEGACY_CRC
+    /* a payload whose CRC differs under the legacy table: scan for one */
+    Buf b = {0};
+    size_t flen = 0;
+    uint8_t* f = NULL;
+    for (unsigned v = 0; v < 256 && !f; v++) {
+        b.n = 0;
+        b8(&b, 0x02); b8(&b, v);
+        uint8_t* cand = okframe(b.p, b.n, &flen);
+        if (ref_crc32(cand, flen - 4, 1) != ref_crc32(cand, flen - 4, 0)) f = cand; else free(cand);
+    }
+    CHECK(f != NULL);                                           /* some frame really exercises entry 245 */
+    uint8_t* g = (uint8_t*)malloc(flen);
+    CHECK(g != NULL);
+    memcpy(g, f, flen);
+    uint32_t legacy = ref_crc32(g, flen - 4, 1);
+    g[flen - 4] = (uint8_t)(legacy >> 24); g[flen - 3] = (uint8_t)(legacy >> 16);
+    g[flen - 2] = (uint8_t)(legacy >> 8);  g[flen - 1] = (uint8_t)legacy;
+    DCFSerReader r;
+    CHECK_OK(open_reader(&r, f, flen, 0));                       /* standard: accepted by default */
+    CHECK_EQ(open_reader(&r, g, flen, 0), DCF_SER_ERR_CRC_MISMATCH);   /* legacy: refused by default */
+    CHECK_OK(open_reader(&r, g, flen, DCF_SER_POLICY_ALLOW_LEGACY_CRC));
+    CHECK(r.crc_verified);
+    /* the opt-in widens nothing else: a frame with neither CRC is still refused */
+    g[flen - 1] ^= 0x01;
+    CHECK_EQ(open_reader(&r, g, flen, DCF_SER_POLICY_ALLOW_LEGACY_CRC), DCF_SER_ERR_CRC_MISMATCH);
+    return 0;
+#else
+    fprintf(stderr, "FAIL: API absent (no DCF_SER_POLICY_ALLOW_LEGACY_CRC)\n");
+    return 1;
+#endif
+}
+
+/* ============================================================================
  * Runner
  * ============================================================================ */
 
@@ -1586,6 +1671,8 @@ static const TestCase tests[] = {
     T(t_s9_strict_validate_rejects_hostile_payloads, "S3/S4"),
     T(t_s9_typed_array_cap_beyond_count_limit, "S3"),
     T(t_s9_validate_payload_agrees_with_typed_reads, "S8"),
+    T(t_s10_crc32_is_standard, "S10"),
+    T(t_s10_legacy_crc_is_opt_in, "S10"),
 };
 
 static const char* first_interesting(const char* log) {
