@@ -88,7 +88,7 @@ endif
 DOCKER_IMAGE := dcf-serialize
 DOCKER_TAG   := $(VERSION)
 
-.PHONY: all clean install uninstall test interop bench memcheck fuzz check-gate docker docker-load docker-push help
+.PHONY: all clean install uninstall test interop check-readme bench memcheck fuzz check-gate docker docker-load docker-push help
 
 # Default target
 all: $(STATIC_LIB) $(SHARED_LIB) $(TEST_BINS)
@@ -150,6 +150,10 @@ interop: $(STATIC_LIB) $(HDRS) scripts/varsint_emit.c scripts/varsint_interop.py
 	$(CC) $(CFLAGS) scripts/varsint_emit.c $(STATIC_LIB) -o varsint_emit $(LDFLAGS)
 	./varsint_emit | python3 scripts/varsint_interop.py
 	@rm -f varsint_emit
+
+# The README's example programs still build (-Wall -Wextra -Werror) and link. Needs python3.
+check-readme: $(STATIC_LIB)
+	python3 scripts/check-readme-examples.py $(CC)
 
 # Cost of the gate next to the C validator (one machine, one run: re-measure, do not quote)
 bench: $(STATIC_LIB) $(HDRS) gate/dcfs_gate_bench.c
@@ -260,6 +264,8 @@ help:
 	@echo "  memcheck      - Run tests under valgrind"
 	@echo "  fuzz          - Fuzz the reader and writer (FUZZ_SECONDS=120, FUZZ_ENGINE=mutation|libfuzzer)"
 	@echo "  check-gate    - Re-emit the Exsecutor gate and compare with gate/ (skips without exsc)"
+	@echo "  interop       - Check write_varsint / CRC-32 against an independent Python decoder"
+	@echo "  check-readme  - Build the README's example programs with -Wall -Wextra -Werror"
 	@echo ""
 	@echo "Install:"
 	@echo "  install       - Install to PREFIX (default: /usr/local)"

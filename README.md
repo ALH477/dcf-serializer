@@ -90,7 +90,8 @@ BSD-3-Clause repository is pending an owner decision** ([`gate/PROVENANCE.md`](g
 
 This release hardens the reader and writer. `DCF_SER_VERSION` is **not** bumped and the
 wire layout and type tags are unchanged, but several things that used to be accepted are
-refused, and one thing the library *computed* was wrong. Exactly what changed:
+refused, and two things the library *computed* were wrong (the CRC-32 table and the ZigZag encoding of
+negative `varsint` values; both are wire-visible and described below). Exactly what changed:
 
 **Reader (strict by default)**
 
@@ -104,13 +105,17 @@ refused, and one thing the library *computed* was wrong. Exactly what changed:
 | `validate()` checked header and CRC only | also walks the payload: it must be well-formed tagged values (depth <= 32, counts, UTF-8, canonical varints) | `ALLOW_UNSTRUCTURED` (skip the walk); `ALLOW_NONCANONICAL_VARINT`; `ALLOW_INVALID_UTF8` |
 | `dcf_ser_reader_skip` advanced without bounds checks (`remaining()` could underflow to ~2^64), recursed without limit (stack overflow on nested headers), and its MAP count overflowed `uint32_t` | bounds-checked, iterative, depth-limited, all-or-nothing (position unchanged on error); `DCF_SER_ERR_TRUNCATED` / `DCF_SER_ERR_DEPTH_EXCEEDED` | never |
 | `read_raw` / `read_raw_ptr` could wrap on a huge length and copy out of bounds | `DCF_SER_ERR_TRUNCATED` | never |
+| `read_raw(r, out, 0)` / `read_raw_ptr(r, &p, 0)` on a reader that was never validated (a failed `reader_init` leaves it zeroed) returned OK and did `memcpy(out, NULL, 0)` (undefined behaviour) | `DCF_SER_ERR_TRUNCATED` for any length on an unvalidated reader | never |
+| a typed read that failed (type mismatch, truncated body, invalid string, too-small copy buffer, refused container header) had already consumed the tag byte, so the next read started in the middle of the value | **every typed read is all-or-nothing**: on any error the reader is exactly where it was (`dcf_ser_read_field` is the one exception: the struct end marker, reported as `DCF_SER_ERR_NOT_FOUND`, is consumed on purpose). A too-small `read_string_copy` / `read_bytes_copy` buffer reports `OVERFLOW` with the needed length in `*out_len` and consumes nothing, so the call can be repeated with a bigger one | never |
+| `dcf_ser_reader_validate` did not reset `reader->depth`, and a failed `dcf_ser_read_struct_schema` returned with `depth` still incremented: a reader pointed at a new frame, or a "read schema, on error skip, continue" loop, accumulated depth until every container read and skip was `DEPTH_EXCEEDED` | `validate` starts at depth 0; a failed schema read restores **both** position (the struct is still there to skip) and depth | never |
+| `dcf_ser_read_struct_schema` scanned the whole schema for every wire field: a 16 MiB frame of 4,194,302 unknown 4-byte fields against a 256-field schema cost 423-524 ms of CPU (about 3.2-3.9x its receive time at 1 Gbit/s) | the schema's ids are indexed once per call (sorted, binary search): same frame 86-109 ms (table below). Which entry wins for a repeated id in the *schema* (the first) is unchanged | never |
 | `read_array_begin` / `read_map_begin` returned any `uint32_t` count | refused above `DCF_SER_MAX_ARRAY` or more than the bytes left | never |
 | `read_string` ignored `DCF_SER_MAX_STRING` and UTF-8 | refused above 64 KiB (`TOO_LARGE`) or invalid UTF-8 (`MALFORMED`) | `ALLOW_INVALID_UTF8` for UTF-8 only |
 | `read_string_copy` accepted an embedded NUL (the C string was silently truncated) | `DCF_SER_ERR_MALFORMED` | never |
 | `read_varint` accepted overlong encodings and silently dropped bits of a 10th byte above 1 | overlong: `MALFORMED`; 10th byte above 1: `OVERFLOW` | `ALLOW_NONCANONICAL_VARINT` for overlong only |
 | schema reads: `DCF_FIELD_REQUIRED` never enforced, a repeated field id silently last-wins | missing required field / repeated id: `MALFORMED`; field header type differing from the schema: `TYPE_MISMATCH` | `LAX_SCHEMA` |
 | schema reads silently **dropped** `DCF_TYPE_STRING` fields that `dcf_ser_write_struct_schema` can write | the schema is refused up front, `DCF_SER_ERR_INVALID_TYPE` (a string cannot be read into a struct; use the typed API) | never |
-| a schema field whose type, size or offset did not fit the type / `struct_size` became a wire-driven overflow; fields were loaded and stored through misaligned casts | `DCF_SER_ERR_INVALID_ARG` / `INVALID_TYPE` before any access; at most `DCF_SER_MAX_SCHEMA_FIELDS` (256) fields; `memcpy` loads and stores; the struct is zeroed on error | never |
+| a schema field whose type, size or offset did not fit the type / `struct_size` became a wire-driven overflow; fields were loaded and stored through misaligned casts | `DCF_SER_ERR_INVALID_ARG` / `INVALID_TYPE` before any access; at most `DCF_SER_MAX_SCHEMA_FIELDS` (256) fields; `memcpy` loads and stores. **On a wire-driven error the struct is zeroed and the reader is left where it was; when the schema itself is refused (a `STRING` field, a field that does not fit) nothing is touched: the struct keeps whatever it held and the reader does not move** | never |
 | `dcf_ser_reader_init` left the reader untouched on error | leaves a zeroed (empty, strict) reader | n/a |
 
 **Writer**
@@ -124,6 +129,8 @@ refused, and one thing the library *computed* was wrong. Exactly what changed:
 | `write_raw` / `write_reserve` and buffer growth did arithmetic that could wrap (out-of-bounds `memcpy`; an infinite loop in `writer_grow`) | overflow-safe; a length above `DCF_SER_MAX_MESSAGE` is `DCF_SER_ERR_TOO_LARGE` |
 | the payload was uncapped for external buffers | capped at `DCF_SER_MAX_MESSAGE`; `finish()` refuses more |
 | `dcf_ser_write_array_end` documented "validates count" but did not | the documentation is corrected: it only closes the nesting level |
+| `dcf_ser_writer_init` / `_init_buffer` accepted flag bits `0x40` and `0x80` that no reader of this library accepts | `DCF_SER_ERR_INVALID_ARG` (the writer is left zeroed). `dcf_ser_writer_reset` has no result to return, so bad flags there make the writer fail closed: the next write and `finish()` return `INVALID_ARG` until a good reset |
+| **`dcf_ser_write_varsint` wrote every negative value wrong** (see "ZigZag" below) | fixed; a **wire change** for negative values |
 
 **CRC-32 (a wire-visible fix, found by the gate's differential test).** `crc32_table[245]`
 was `0xCDD706B3`; the IEEE 802.3 value is `0xCDD70693`. `dcf_ser_crc32()` therefore was
@@ -134,6 +141,57 @@ these as an estimate). The documented test vector (`"123456789"`) never touches 
 uncorrected node reject each other's frames whenever entry 245 is hit.** Upgrade
 readers first with `DCF_SER_POLICY_ALLOW_LEGACY_CRC` (accepts the standard CRC *or* the old
 one, nothing else relaxed; the gate is not consulted under it), then writers, then drop the flag.
+**Turn the flag off as soon as every peer is upgraded**: it is not "either CRC and nothing else". Because
+`0xCDD706B3 ^ 0xCDD70693 == 0x20` and CRC-32 is linear, a standard-CRC frame whose byte after a
+table-entry-245 lookup has exactly bit 5 flipped (and which has no other entry-245 lookup after it) is
+accepted as a "legacy" frame: under the flag a single-bit error in that one position is not detected
+(`t_i1_legacy_crc_one_bit_blind_spot` pins this down). Without the flag the CRC catches it.
+
+**ZigZag (a wire-visible fix, found by an independent review; pre-existing).** `dcf_ser_write_varsint`
+computed `((uint64_t)val << 1) ^ ((uint64_t)val >> 63)`: the cast to unsigned came *before* the shift, so
+the "sign fill" was a logical shift (0 or 1) instead of all-zeros / all-ones, and **every negative value was
+encoded wrong** (`-1` was written as 2^64-1 and read back as `INT64_MIN`; `INT64_MIN` was written as `1` and read
+back as `-1`). The reader's decoder was always the standard one. Non-negative values are unchanged. The
+sign fill is now `0 - (sign bit)`, which does not rely on the implementation-defined right shift of a
+negative signed value. The wire bytes now equal the standard ZigZag (protobuf's), checked against
+hard-coded vectors and by an independent Python decoder (`make interop`), not by a round trip, which is how
+this was missed:
+
+| value | ZigZag | LEB128 bytes after the `0x10` tag |
+|---|---|---|
+| `0` | 0 | `00` |
+| `-1` | 1 | `01` |
+| `1` | 2 | `02` |
+| `-2` | 3 | `03` |
+| `2` | 4 | `04` |
+| `2147483647` | 4294967294 | `fe ff ff ff 0f` |
+| `-2147483648` | 4294967295 | `ff ff ff ff 0f` |
+| `INT64_MAX` | 2^64-2 | `fe ff ff ff ff ff ff ff ff 01` |
+| `INT64_MIN` | 2^64-1 | `ff ff ff ff ff ff ff ff ff 01` |
+
+There is deliberately **no compatibility flag**: the old writer and the (correct) reader were already
+inconsistent for negatives, so a negative `varsint` from an old sender was corrupt on arrival, and there is no
+value to "accept as legacy". Values written by an old sender that were negative must be treated as lost;
+those written as `>= 0` are fine. Because a corrected writer's negative values differ from an old
+writer's, **this changes the wire for negative `varsint` values**, like the CRC-32 fix above; both are
+listed for the owner's version / soname decision.
+
+**Writer / reader asymmetries.** The writer is not a grammar enforcer: it does not stop you from writing a
+frame the strict reader refuses. Everything that can happen with the typed writer functions, and what the
+reader does with it (each row is a test, `t_n7_documented_asymmetries`):
+
+| the writer lets you | the strict reader |
+|---|---|
+| `dcf_ser_write_array_begin(count)` / `map_begin(count)` followed by **fewer** elements than `count` | refuses (`TRUNCATED`: the count is checked against the bytes present, and the elements are walked) |
+| the same followed by **more** elements than `count` | **accepts**: the extras are read as top-level values after the container, so a typed consumer sees a different shape than the sender meant (the library does not count the elements the writer was given) |
+| `dcf_ser_write_struct_begin` without `dcf_ser_write_struct_end` | refuses (`TRUNCATED`: no end marker) |
+| `dcf_ser_write_field(w, 0, DCF_TYPE_NULL)` (id 0, type NULL) | that pair *is* the struct end marker: the struct ends there and what follows is read as top-level values |
+| `dcf_ser_write_field` with a type that differs from the value then written | accepts it in the structure walk; **schema** reads refuse it (`TYPE_MISMATCH`) unless `LAX_SCHEMA` |
+| `dcf_ser_write_field` outside a struct, `*_end` without `*_begin` | the field header is read as values (usually refused); `*_end` without `*_begin` is `MALFORMED` at the writer (sticky) |
+| `dcf_ser_write_raw` / `dcf_ser_write_reserve` | refuses unless `ALLOW_UNSTRUCTURED` |
+| flags `NO_CRC`, `COMPRESSED`, `ENCRYPTED` | refuses unless `ALLOW_NO_CRC` / `ALLOW_APP_FLAGS` |
+| flags `0x40`, `0x80` | the writer now refuses to start (see above); a hand-built frame with them is refused by the reader under every policy |
+| invalid UTF-8 in `write_string*`, a payload over 16 MiB, nesting over 32 | the writer refuses, like the reader (no asymmetry) |
 
 **Framing.** `dcf_ser_message_length()` reads 17 bytes blind and returned unvalidated sizes
 up to 4 GiB + 21. It is **deprecated** (a compiler warning; silence with
@@ -148,10 +206,27 @@ soname is the owner's decision). New: `dcf_ser_reader_set_policy`, `dcf_ser_vali
 `DCF_SER_FLAG_RESERVED`, `DCF_SER_MAX_SCHEMA_FIELDS`, the `DCF_SER_POLICY_*` flags and the
 feature macro `DCF_SER_HARDENED_API`.
 
-**Not changed:** `DCF_SER_VERSION` (5.2.0), the header layout, the type tags, and the round trip of a
+**Not changed:** `DCF_SER_VERSION` (5.2.0), the header layout, the type tags, the encoding of every type
+except negative `varsint` and the CRC value, and the round trip of a
 frame built with the typed writer functions (with a CRC, honest array counts, UTF-8 strings): the
 hostile suite and the fuzzer both check that what the writer finishes the strict reader accepts.
 Payloads built with `dcf_ser_write_raw` / `dcf_ser_write_reserve` need `ALLOW_UNSTRUCTURED` to be read back.
+
+**Measured, schema reads** (the independent reviewer's `g6_dos.c`, unmodified: a 16 MiB frame of 4,194,302
+unknown 4-byte fields against a 256-field schema; gcc -O2; six runs each, three before the change and three
+interleaved with the "after" runs, on a shared 4-core sandbox whose load average was 1.3-4.7, so read the
+ranges, not the single numbers):
+
+| `dcf_ser_read_struct_schema` | before | after |
+|---|---|---|
+| CPU per frame | 423 - 524 ms (475, 493, 459, 494, 423, 524) | 86 - 109 ms (89, 92, 95, 109, 87, 86) |
+| per wire field | 101 - 125 ns | 21 - 26 ns |
+| compared with `dcf_ser_reader_validate` of the same frame (about 52 ms) | about 8 - 10x | about 1.7 - 2.1x |
+| against a 1 Gbit/s receive time (about 134 ms) | about 3.2 - 3.9x | about 0.65 - 0.8x |
+
+The regression test (`t_n2_schema_lookup_not_linear`) is relative, not absolute: a 256-field schema must
+cost no more than 2.5x a 1-field schema on the same 1,000,000-field frame. Before: 11.5x (-O2), 10.9x
+(ASan, -O0); after: 1.5x (-O2), 1.3x (ASan, -O0).
 
 ## Quick Start
 
@@ -777,8 +852,11 @@ A complete tool that mirrors traffic from one port to another with DCF serializa
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sys/select.h>
+#include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 
@@ -885,9 +963,17 @@ static void* relay_thread(void* arg) {
 }
 
 int main(int argc, char** argv) {
-    /* ... argument parsing and socket setup ... */
+    if (argc < 4) {
+        fprintf(stderr, "Usage: %s <listen_port> <mirror_host> <mirror_port> "
+                        "[--passthrough <upstream_host> <upstream_port>]\n", argv[0]);
+        return 1;
+    }
+    /* ... socket setup ... */
     printf("[DCF Mirror] Traffic mirroring active\n");
-    /* ... main accept loop creating relay threads ... */
+    /* ... main accept loop: for each client, fill in a Connection and start
+     *     pthread_create(&tid, NULL, relay_thread, conn) ... */
+    void* (*start)(void*) = relay_thread;     /* what the accept loop passes to pthread_create */
+    (void)start;
     return 0;
 }
 ```
@@ -898,14 +984,23 @@ Add to your Makefile or compile directly:
 
 ```bash
 # Compile with the DCF library
-gcc -o dcf_capture_relay dcf_capture_relay.c -L. -ldcf_serialize -lpthread
-gcc -o dcf_receiver dcf_receiver.c -L. -ldcf_serialize
-gcc -o dcf_udp_sender dcf_udp_sender.c -L. -ldcf_serialize
-gcc -o dcf_udp_receiver dcf_udp_receiver.c -L. -ldcf_serialize
+gcc -Wall -Wextra -Werror -o dcf_capture_relay dcf_capture_relay.c -L. -ldcf_serialize -lpthread
+gcc -Wall -Wextra -Werror -o dcf_receiver dcf_receiver.c -L. -ldcf_serialize
+gcc -Wall -Wextra -Werror -o dcf_udp_sender dcf_udp_sender.c -L. -ldcf_serialize
+gcc -Wall -Wextra -Werror -o dcf_udp_receiver dcf_udp_receiver.c -L. -ldcf_serialize
+gcc -Wall -Wextra -Werror -o dcf_mirror dcf_mirror.c -L. -ldcf_serialize -lpthread
 
 # Or link statically
 gcc -o dcf_receiver dcf_receiver.c dcf_serialize.c -O2
 ```
+
+The five programs are written for the compiler's default (GNU) mode. They use POSIX/GNU functions
+(`clock_gettime`, `usleep`, `fd_set`, `accept`, ...), so under a strict `-std=c11` add
+`-D_GNU_SOURCE`. All five were extracted from this file and built with `-Wall -Wextra -Werror`,
+both in the default mode and with `-std=c11 -D_GNU_SOURCE`, against this tree's `dcf_serialize.h`
+and linked against `libdcf_serialize.a` (`make check-readme` repeats it). A `-Werror` build of your
+own code also needs the deprecation warning kept out of it: use `dcf_ser_message_length_checked`,
+as Example 2 does.
 
 ### Testing the Examples
 
