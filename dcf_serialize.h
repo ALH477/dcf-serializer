@@ -307,7 +307,10 @@ uint64_t dcf_ser_ntoh64(uint64_t val);
  * ============================================================================ */
 
 /**
- * Calculate CRC32 checksum
+ * Calculate CRC32 checksum: the standard CRC-32 (IEEE 802.3, reflected, polynomial
+ * 0xEDB88320, init and final xor 0xFFFFFFFF; crc32("123456789") = 0xCBF43926).
+ * Releases before the hardening change had a mistyped table entry and computed a
+ * different value for many inputs; see DCF_SER_POLICY_ALLOW_LEGACY_CRC.
  */
 uint32_t dcf_ser_crc32(const void* data, size_t len);
 
@@ -531,7 +534,8 @@ DCFSerError dcf_ser_reader_init(DCFSerReader* reader, const void* data, size_t l
 #define DCF_SER_POLICY_ALLOW_UNSTRUCTURED       0x20u  /* payload need not be a sequence of tagged values (write_raw / write_reserve users) */
 #define DCF_SER_POLICY_LAX_SCHEMA               0x40u  /* schema reads: tolerate missing REQUIRED fields, duplicate ids, header/type disagreement */
 #define DCF_SER_POLICY_ALLOW_APP_FLAGS          0x80u  /* accept DCF_SER_FLAG_COMPRESSED / DCF_SER_FLAG_ENCRYPTED (application handles them) */
-#define DCF_SER_POLICY_ALL                      0xFFu
+#define DCF_SER_POLICY_ALLOW_LEGACY_CRC         0x100u /* migration only: also accept the CRC computed by releases whose table entry 245 was mistyped */
+#define DCF_SER_POLICY_ALL                      0x1FFu
 
 /**
  * Set the reader policy. Must be called after dcf_ser_reader_init() and before

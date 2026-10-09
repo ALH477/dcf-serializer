@@ -107,7 +107,7 @@ static const uint32_t crc32_table[256] = {
     0x616BFFD3, 0x166CCF45, 0xA00AE278, 0xD70DD2EE, 0x4E048354, 0x3903B3C2,
     0xA7672661, 0xD06016F7, 0x4969474D, 0x3E6E77DB, 0xAED16A4A, 0xD9D65ADC,
     0x40DF0B66, 0x37D83BF0, 0xA9BCAE53, 0xDEBB9EC5, 0x47B2CF7F, 0x30B5FFE9,
-    0xBDBDF21C, 0xCABAC28A, 0x53B39330, 0x24B4A3A6, 0xBAD03605, 0xCDD706B3,
+    0xBDBDF21C, 0xCABAC28A, 0x53B39330, 0x24B4A3A6, 0xBAD03605, 0xCDD70693,
     0x54DE5729, 0x23D967BF, 0xB3667A2E, 0xC4614AB8, 0x5D681B02, 0x2A6F2B94,
     0xB40BBE37, 0xC30C8EA1, 0x5A05DF1B, 0x2D02EF8D
 };
@@ -199,6 +199,22 @@ uint32_t dcf_ser_crc32_update(uint32_t crc, const void* data, size_t len) {
         crc = crc32_table[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
     }
     return crc;
+}
+
+/* Releases before this fix shipped a crc32_table whose entry 245 was 0xCDD706B3
+ * instead of the IEEE 802.3 value 0xCDD70693, so their "CRC-32" differed from
+ * every other CRC-32 for any input that looks up entry 245 (about one frame in
+ * three at 100 bytes). Readers can be told to still accept it during a fleet
+ * upgrade (DCF_SER_POLICY_ALLOW_LEGACY_CRC); nothing writes it any more. */
+static uint32_t crc32_legacy(const void* data, size_t len) {
+    const uint8_t* p = (const uint8_t*)data;
+    uint32_t crc = 0xFFFFFFFF;
+    while (len--) {
+        uint32_t idx = (crc ^ *p++) & 0xFF;
+        uint32_t entry = (idx == 245) ? 0xCDD706B3u : crc32_table[idx];
+        crc = entry ^ (crc >> 8);
+    }
+    return crc ^ 0xFFFFFFFF;
 }
 
 /* ============================================================================
@@ -1099,7 +1115,9 @@ DCFSerError dcf_ser_reader_validate(DCFSerReader* reader) {
         uint32_t stored_crc = rd_be32(reader->buffer + crc_offset);
         uint32_t computed_crc = dcf_ser_crc32(reader->buffer, crc_offset);
         
-        if (stored_crc != computed_crc) {
+        if (stored_crc != computed_crc &&
+            !((policy & DCF_SER_POLICY_ALLOW_LEGACY_CRC) &&
+              stored_crc == crc32_legacy(reader->buffer, crc_offset))) {
             reader->last_error = DCF_SER_ERR_CRC_MISMATCH;
             return DCF_SER_ERR_CRC_MISMATCH;
         }
@@ -1122,7 +1140,8 @@ DCFSerError dcf_ser_reader_validate(DCFSerReader* reader) {
      * beyond that; trailing bytes are cut off before it sees the frame. */
     if (!(policy & (DCF_SER_POLICY_NO_GATE | DCF_SER_POLICY_ALLOW_NO_CRC |
                     DCF_SER_POLICY_ALLOW_NONCANONICAL_VARINT | DCF_SER_POLICY_ALLOW_INVALID_UTF8 |
-                    DCF_SER_POLICY_ALLOW_UNSTRUCTURED | DCF_SER_POLICY_ALLOW_APP_FLAGS))) {
+                    DCF_SER_POLICY_ALLOW_UNSTRUCTURED | DCF_SER_POLICY_ALLOW_APP_FLAGS |
+                    DCF_SER_POLICY_ALLOW_LEGACY_CRC))) {
         DCFSerError e = gate_confirm(reader->buffer, expected_size);
         if (e != DCF_SER_OK) {
             reader->last_error = e;
@@ -1308,7 +1327,8 @@ DCFSerError dcf_ser_read_varsint(DCFSerReader* r, int64_t* out) {
     DCF_SER_CHECK(dcf_ser_read_varint(r, &zigzag));
     
     /* ZigZag decoding */
-    *out = (int64_t)((zigzag >> 1) ^ -(int64_t)(zigzag & 1));
+    uint64_t sign_mask = (uint64_t)0 - (zigzag & 1);
+    *out = (int64_t)((zigzag >> 1) ^ sign_mask);
     return DCF_SER_OK;
 }
 
