@@ -24,6 +24,13 @@ ifdef DEBUG
   LDFLAGS   += -fsanitize=address,undefined
 endif
 
+# The Exsecutor admission gate (gate/) is wired in a later commit; until then
+# the library is built with it compiled out (-DDCF_SER_NO_GATE).
+GATE        ?= 0
+ifeq ($(GATE),0)
+  CFLAGS    += -DDCF_SER_NO_GATE
+endif
+
 # Source files
 SRCS        := dcf_serialize.c
 HDRS        := dcf_serialize.h

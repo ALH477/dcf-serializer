@@ -552,9 +552,15 @@ static int test_no_crc(void) {
     
     print_hex(data, len, "No-CRC");
     
-    /* Message should be 4 bytes shorter (no CRC) */
+    /* The default (strict) reader refuses a frame with no checksum ... */
     DCFSerReader reader;
     TEST_CHECK(dcf_ser_reader_init(&reader, data, len));
+    TEST_ASSERT(dcf_ser_reader_validate(&reader) == DCF_SER_ERR_POLICY,
+                "strict reader should refuse NO_CRC");
+    
+    /* ... a trusted-channel reader opts in to it. Message is 4 bytes shorter (no CRC). */
+    TEST_CHECK(dcf_ser_reader_init(&reader, data, len));
+    TEST_CHECK(dcf_ser_reader_set_policy(&reader, DCF_SER_POLICY_ALLOW_NO_CRC));
     TEST_CHECK(dcf_ser_reader_validate(&reader));
     
     TEST_ASSERT(!reader.crc_verified, "CRC should not be verified in NO_CRC mode");

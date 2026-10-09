@@ -23,7 +23,7 @@ ENV DCF_VERSION=${VERSION}
 WORKDIR /build
 
 # Copy source files
-COPY dcf_serialize.h dcf_serialize.c dcf_serialize_test.c Makefile ./
+COPY dcf_serialize.h dcf_serialize.c dcf_serialize_test.c dcf_serialize_hostile_test.c Makefile ./
 COPY LICENSE ./
 
 # Build library and run tests

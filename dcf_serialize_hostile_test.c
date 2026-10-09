@@ -24,6 +24,8 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+/* the suite exercises the deprecated dcf_ser_message_length() on purpose */
+#define DCF_SER_NO_DEPRECATION_WARNINGS 1
 #include "dcf_serialize.h"
 
 #include <signal.h>
@@ -781,7 +783,12 @@ static int t_s5_finish_refuses_oversize_payload(void) {
     CHECK_OK(dcf_ser_writer_init_buffer(&w, big, cap, 1, 0));
     uint8_t* p = NULL;
     CHECK_OK(dcf_ser_write_reserve(&w, (size_t)DCF_SER_MAX_MESSAGE, &p));     /* exactly the cap */
-    (void)dcf_ser_write_u8(&w, 1);                                            /* one value too many: may fail now ... */
+    DCFSerError we = dcf_ser_write_u8(&w, 1);                                 /* one value too many ... */
+#ifdef DCF_SER_HARDENED_API
+    CHECK_EQ(we, DCF_SER_ERR_TOO_LARGE);                                      /* ... is refused when written ... */
+#else
+    (void)we;
+#endif
     const uint8_t* d; size_t n;                                               /* ... and finish() must not bless it */
     DCFSerError e = dcf_ser_writer_finish(&w, &d, &n);
     if (e == DCF_SER_OK) {
@@ -1409,6 +1416,107 @@ static int t_s9_strict_validate_rejects_hostile_payloads(void) {
     return 0;
 }
 
+static int t_s9_typed_array_cap_beyond_count_limit(void) {
+    /* count above DCF_SER_MAX_ARRAY with enough bytes to "back" it: the cap, not the
+     * remaining-bytes check, has to be what refuses it */
+    size_t n = (size_t)DCF_SER_MAX_ARRAY + 1;
+    Buf a = {0};
+    b8(&a, 0x20); b8(&a, 0x00); b32(&a, (uint32_t)n);
+    bzero(&a, n);
+    size_t flen;
+    uint8_t* f = okframe(a.p, a.n, &flen);
+    DCFSerReader r;
+    CHECK_OK(open_reader(&r, f, flen, POL_RAW));
+    DCFSerType t; size_t c = 0;
+    DCFSerError e = dcf_ser_read_array_begin(&r, &t, &c);
+    if (e == DCF_SER_OK) { fprintf(stderr, "FAIL: array count %zu (> DCF_SER_MAX_ARRAY) accepted by read_array_begin\n", c); return 1; }
+    CHECK_EQ(e, DCF_SER_ERR_TOO_LARGE);
+    free(f);
+    /* exactly the cap, fully backed, is fine */
+    Buf ok = {0};
+    b8(&ok, 0x20); b8(&ok, 0x00); b32(&ok, DCF_SER_MAX_ARRAY);
+    bzero(&ok, DCF_SER_MAX_ARRAY);
+    f = okframe(ok.p, ok.n, &flen);
+    CHECK_OK(open_reader(&r, f, flen, POL_RAW));
+    CHECK_OK(dcf_ser_read_array_begin(&r, &t, &c));
+    CHECK_EQ(c, DCF_SER_MAX_ARRAY);
+    /* and the map equivalent */
+    Buf m = {0};
+    b8(&m, 0x21); b8(&m, 0); b8(&m, 0); b32(&m, (uint32_t)n);
+    bzero(&m, 2 * n);
+    uint8_t* f2 = okframe(m.p, m.n, &flen);
+    DCFSerType kt, vt;
+    CHECK_OK(open_reader(&r, f2, flen, POL_RAW));
+    CHECK_EQ(dcf_ser_read_map_begin(&r, &kt, &vt, &c), DCF_SER_ERR_TOO_LARGE);
+    return 0;
+}
+
+/* The structural walker (dcf_ser_validate_payload / strict validate) and the
+ * typed readers must give the same answer on varints and strings: a payload
+ * the walker blesses must not be one a typed read of the same bytes refuses. */
+static int t_s9_validate_payload_agrees_with_typed_reads(void) {
+    API_ABSENT_PROLOGUE;
+#ifdef DCF_SER_HARDENED_API
+    struct VC { const char* name; uint8_t bytes[16]; unsigned n; int want_ok; };
+    static const struct VC varints[] = {
+        {"0",                      {0x00}, 1, 1},
+        {"127",                    {0x7F}, 1, 1},
+        {"128",                    {0x80, 0x01}, 2, 1},
+        {"UINT64_MAX",             {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x01}, 10, 1},
+        {"2^63",                   {0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x01}, 10, 1},
+        {"overlong 0 (80 00)",     {0x80, 0x00}, 2, 0},
+        {"overlong 1 (81 00)",     {0x81, 0x00}, 2, 0},
+        {"overlong 0 x10",         {0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x00}, 10, 0},
+        {"10th byte 2",            {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x02}, 10, 0},
+        {"10th byte 0x7F",         {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x7F}, 10, 0},
+        {"10th byte 0x80 (cont.)", {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x80,0x00}, 11, 0},
+        {"11 bytes",               {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x01}, 11, 0},
+        {"dangling continuation",  {0x80}, 1, 0},
+        {"empty",                  {0}, 0, 0},
+    };
+    for (size_t i = 0; i < sizeof varints / sizeof varints[0]; i++) {
+        Buf b = {0};
+        b8(&b, 0x10); bput(&b, varints[i].bytes, varints[i].n);
+        DCFSerError walker = dcf_ser_validate_payload(b.p, b.n, 0);
+        uint64_t v; DCFSerError typed;
+        varint_payload_read(varints[i].bytes, varints[i].n, 0, &v, &typed);
+        if ((walker == DCF_SER_OK) != varints[i].want_ok || (typed == DCF_SER_OK) != varints[i].want_ok) {
+            fprintf(stderr, "FAIL: varint '%s': walker=0x%x typed=0x%x, want %s\n", varints[i].name,
+                    walker, typed, varints[i].want_ok ? "OK" : "refusal");
+            return 1;
+        }
+        free(b.p);
+    }
+    {   /* strings: the 64 KiB cap and UTF-8, walker vs typed */
+        size_t cap = (size_t)DCF_SER_MAX_STRING;
+        uint8_t* body = (uint8_t*)malloc(cap + 1);
+        CHECK(body != NULL);
+        memset(body, 'a', cap + 1);
+        for (int over = 0; over < 2; over++) {
+            size_t len = cap + (size_t)over;
+            Buf b = {0};
+            b8(&b, 0x11); b32(&b, (uint32_t)len); bput(&b, body, len);
+            DCFSerError walker = dcf_ser_validate_payload(b.p, b.n, 0);
+            DCFSerError typed;
+            string_payload_read(body, len, (uint32_t)len, 0, &typed, 0);
+            CHECK_EQ(walker == DCF_SER_OK, over == 0);
+            CHECK_EQ(typed == DCF_SER_OK, over == 0);
+            free(b.p);
+        }
+        static const uint8_t bad[] = {0xE2, 0x82};
+        static const uint8_t good[] = {0xE2, 0x82, 0xAC};
+        Buf b = {0};
+        b8(&b, 0x11); b32(&b, sizeof bad); bput(&b, bad, sizeof bad);
+        CHECK_ERR(dcf_ser_validate_payload(b.p, b.n, 0));
+        CHECK_OK(dcf_ser_validate_payload(b.p, b.n, DCF_SER_POLICY_ALLOW_INVALID_UTF8));
+        b.n = 0;
+        b8(&b, 0x11); b32(&b, sizeof good); bput(&b, good, sizeof good);
+        CHECK_OK(dcf_ser_validate_payload(b.p, b.n, 0));
+    }
+#endif
+    return 0;
+}
+
 /* ============================================================================
  * Runner
  * ============================================================================ */
@@ -1476,6 +1584,8 @@ static const TestCase tests[] = {
     T(t_s8_utf8_lax_policy, "S8"),
     T(t_s8_string_copy_rejects_nul, "S8"),
     T(t_s9_strict_validate_rejects_hostile_payloads, "S3/S4"),
+    T(t_s9_typed_array_cap_beyond_count_limit, "S3"),
+    T(t_s9_validate_payload_agrees_with_typed_reads, "S8"),
 };
 
 static const char* first_interesting(const char* log) {
