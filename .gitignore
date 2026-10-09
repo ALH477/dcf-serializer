@@ -7,6 +7,9 @@ dcf_serialize_test
 dcf_serialize_hostile_test
 dcf_serialize_fuzz
 dcfs_gate_diff_test
+dcfs_gate_guard_test
+dcfs_gate_bench
+fuzz-corpus/
 result
 *.gcov
 *.gcda

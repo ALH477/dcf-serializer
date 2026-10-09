@@ -41,23 +41,40 @@
 
           buildPhase = ''
             runHook preBuild
-            
+
+            # Warnings are part of the build. nixpkgs' compiler wrapper adds its own
+            # hardening (stack protector, fortify, relro/now, PIE) on top.
+            WARN="-Wall -Wextra -Wpedantic -Wformat=2 -Wformat-security -Wconversion -Wsign-conversion -Wshadow -Wstrict-prototypes"
+            CFL="-O2 -fPIC -std=c11 $WARN"
+
+            # The Exsecutor-emitted admission gate (gate/) is GNU C11 and not ours to
+            # warn about; see gate/PROVENANCE.md (licence status: pending owner decision).
+            gcc -O2 -fPIC -std=gnu11 -w -c gate/dcfs_gate_unit.c -o gate/dcfs_gate_unit.o
+            gcc $CFL -c gate/dcfs_gate_host.c -o gate/dcfs_gate_host.o
+            gcc $CFL -c dcf_serialize.c -o dcf_serialize.o
+
             # Build static library
-            gcc -c -O2 -Wall -Wextra -Wpedantic -fPIC dcf_serialize.c -o dcf_serialize.o
-            ar rcs libdcf_serialize.a dcf_serialize.o
-            
+            ar rcs libdcf_serialize.a dcf_serialize.o gate/dcfs_gate_unit.o gate/dcfs_gate_host.o
+
             # Build shared library
-            gcc -shared -fPIC -O2 -Wall -Wextra dcf_serialize.c -o libdcf_serialize.so.${version}
-            
-            # Build test binary
-            gcc -O2 -Wall -Wextra -Wpedantic dcf_serialize_test.c dcf_serialize.c -o dcf_serialize_test
-            
+            gcc -shared dcf_serialize.o gate/dcfs_gate_unit.o gate/dcfs_gate_host.o -o libdcf_serialize.so.${version}
+
+            # Build test binaries: unit, hostile-input, C-vs-gate differential, trap guard
+            gcc $CFL dcf_serialize_test.c libdcf_serialize.a -o dcf_serialize_test
+            gcc $CFL dcf_serialize_hostile_test.c libdcf_serialize.a -o dcf_serialize_hostile_test
+            gcc $CFL gate/dcfs_gate_diff_test.c libdcf_serialize.a -o dcfs_gate_diff_test
+            gcc $CFL gate/dcfs_gate_guard_test.c libdcf_serialize.a -pthread -o dcfs_gate_guard_test
+
             runHook postBuild
           '';
 
           checkPhase = ''
             runHook preCheck
             ./dcf_serialize_test
+            ./dcf_serialize_hostile_test
+            ./dcfs_gate_diff_test
+            ./dcfs_gate_guard_test
+            bash scripts/check-gate-fresh.sh
             runHook postCheck
           '';
 
@@ -91,8 +108,11 @@
             Cflags: -I\''${includedir}
             EOF
             
-            # Test binary (optional, for verification)
+            # Test binaries (optional, for verification)
             install -Dm755 dcf_serialize_test $out/bin/dcf_serialize_test
+            install -Dm755 dcf_serialize_hostile_test $out/bin/dcf_serialize_hostile_test
+            install -Dm755 dcfs_gate_diff_test $out/bin/dcfs_gate_diff_test
+            install -Dm755 dcfs_gate_guard_test $out/bin/dcfs_gate_guard_test
             
             # License and documentation
             install -Dm644 LICENSE $out/share/licenses/${pname}/LICENSE
@@ -253,6 +273,14 @@
             touch $out
           '';
           
+          # The vendored Exsecutor gate still matches the hashes in gate/PROVENANCE.md
+          # (re-emission needs exsc and is skipped here; run `make check-gate` with EXSECUTOR set).
+          gate-fresh = pkgs.runCommand "check-gate-fresh" {} ''
+            cd ${./.}
+            bash scripts/check-gate-fresh.sh
+            touch $out
+          '';
+
           lint = pkgs.runCommand "check-lint" {
             buildInputs = [ pkgs.cppcheck ];
           } ''
