@@ -24,7 +24,7 @@
  * Frames above the capacity are checked one way only: whatever the C validator
  * accepts, the header-only gate must accept too.
  *
- * Usage: dcfs_gate_diff_test [cases]      (default 250000 random cases)
+ * Usage: dcfs_gate_diff_test [cases [seed]]      (default 250000 random cases, fixed seed)
  */
 
 #include "../dcf_serialize.h"
@@ -570,6 +570,7 @@ int main(int argc, char** argv) {
     unsigned long long random_cases = 250000;
     unsigned long long required = 200000;                 /* the default run must be a real one */
     if (argc > 1) { random_cases = strtoull(argv[1], NULL, 0); required = 0; }   /* a short run (valgrind) is the caller's choice */
+    if (argc > 2) rng_state = strtoull(argv[2], NULL, 0) | 1;                      /* another seed: a wider search */
 
     printf("=== DCFS differential: C validator vs Exsecutor gate ===\n");
     family_headers();

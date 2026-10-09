@@ -16,7 +16,9 @@ DCF Serialize provides a system-agnostic binary serialization layer for the DeMo
 - **Network Byte Order**: Big-endian wire format with automatic conversion
 - **Zero-Copy Reads**: Direct buffer access where possible
 - **Type-Safe**: Self-describing format with type tags
-- **CRC32 Integrity**: Built-in checksum validation
+- **CRC32 Integrity**: Built-in checksum validation (error detection, **not** authentication -- see [Security](#security))
+- **Strict by Default**: the reader refuses what it cannot vouch for; trusted channels opt back in per reader
+- **Two-implementation check**: an Exsecutor-generated admission gate agrees with the C validator on every accepted frame
 - **Schema Support**: Reflection-based struct serialization
 - **Variable-Length Encoding**: LEB128 for efficient integer encoding
 - **No Dependencies**: Pure C11, no external libraries required
@@ -29,6 +31,127 @@ DCF Serialize provides a system-agnostic binary serialization layer for the DeMo
 │  4 bytes │ 2 bytes │ 2 bytes  │ 1 byte│  4 bytes   │  4 bytes │ N bytes  │  4 bytes │
 └──────────┴─────────┴──────────┴───────┴────────────┴──────────┴──────────┴──────────┘
 ```
+
+## Security
+
+DCF frames are parsed from bytes a remote peer chose, so the reader is built to
+refuse, not to guess.
+
+**The reader is strict by default.** A frame is accepted only if its magic and
+major version are right, no unsupported flag bit is set, a CRC-32 is present and
+correct, `payload_len` is at most `DCF_SER_MAX_MESSAGE` (16 MiB), the buffer is
+exactly one frame (no bytes after it), and the payload is a well-formed sequence of
+tagged values: nesting at most `DCF_SER_MAX_DEPTH` (32), array and map counts at
+most `DCF_SER_MAX_ARRAY` (1 Mi) and never more than the bytes that are there,
+strings at most `DCF_SER_MAX_STRING` (64 KiB) and valid UTF-8, varints in canonical
+form. The grammar is written down in [`gate/README.md`](gate/README.md).
+
+**A trusted channel opts back in, explicitly, per reader:**
+
+```c
+DCFSerReader r;
+dcf_ser_reader_init(&r, buf, len);
+dcf_ser_reader_set_policy(&r, DCF_SER_POLICY_ALLOW_NO_CRC);   /* between init and validate */
+if (dcf_ser_reader_validate(&r) != DCF_SER_OK) { /* ... */ }
+```
+
+| flag | relaxes |
+|---|---|
+| `DCF_SER_POLICY_ALLOW_NO_CRC` | accept `DCF_SER_FLAG_NO_CRC` frames (no integrity check at all) |
+| `DCF_SER_POLICY_ALLOW_TRAILING` | accept bytes after the end of the frame (e.g. padded datagrams) |
+| `DCF_SER_POLICY_ALLOW_NONCANONICAL_VARINT` | accept overlong varints (bits are still never dropped) |
+| `DCF_SER_POLICY_ALLOW_INVALID_UTF8` | accept `STRING` values that are not UTF-8 |
+| `DCF_SER_POLICY_ALLOW_UNSTRUCTURED` | the payload is not a sequence of tagged values (you used `dcf_ser_write_raw` / `write_reserve`) |
+| `DCF_SER_POLICY_ALLOW_APP_FLAGS` | accept `COMPRESSED` / `ENCRYPTED` frames (the library does neither; your application does) |
+| `DCF_SER_POLICY_LAX_SCHEMA` | schema reads tolerate a missing `REQUIRED` field, repeated ids, header/schema type disagreement |
+| `DCF_SER_POLICY_ALLOW_LEGACY_CRC` | migration only: also accept the CRC of releases with the mistyped table (see below) |
+| `DCF_SER_POLICY_NO_GATE` | do not consult the Exsecutor admission gate |
+
+`EXTENDED` and the reserved flag bit are never accepted: they change the framing and
+this reader cannot honour them. An unknown policy bit is refused and leaves the policy
+unchanged; the policy is frozen once `dcf_ser_reader_validate()` has succeeded.
+`dcf_ser_validate_message()` always uses the strict policy.
+
+**CRC32 is an error-detection code, not authentication.** It catches bit rot. It does
+not stop anyone who can alter a frame from recomputing the CRC. Where the sender must
+be proven, use a MAC or an authenticated transport; the strict reader makes a hostile
+frame *safe to parse*, not *trustworthy*.
+
+**Memory safety does not depend on the gate.** Every length, count and depth is
+checked in C with arithmetic that cannot wrap (`n > end - pos`, never `pos + n`).
+The [Exsecutor](https://github.com/ALH477/exsecutor) gate in [`gate/`](gate/) is an
+additional, independent statement of the same policy; a frame is admitted only if the
+C validator and the gate agree (disagreement refuses the frame and is counted by
+`dcf_ser_gate_disagreements()`). Build with `-DDCF_SER_NO_GATE` to drop it. **The
+gate's `.exsc` source is GPL-3.0-or-later; whether its emitted C may ship in this
+BSD-3-Clause repository is pending an owner decision** ([`gate/PROVENANCE.md`](gate/PROVENANCE.md)).
+
+## Security changes
+
+This release hardens the reader and writer. `DCF_SER_VERSION` is **not** bumped and the
+wire layout and type tags are unchanged, but several things that used to be accepted are
+refused, and one thing the library *computed* was wrong. Exactly what changed:
+
+**Reader (strict by default)**
+
+| before | now | opt back in |
+|---|---|---|
+| a `NO_CRC` frame was accepted; nothing checked its bytes | refused, `DCF_SER_ERR_POLICY` | `ALLOW_NO_CRC` |
+| `COMPRESSED` / `ENCRYPTED` bits accepted and ignored | refused, `DCF_SER_ERR_POLICY` | `ALLOW_APP_FLAGS` |
+| `EXTENDED` and bit `0x40` accepted and ignored (`EXTENDED` desynchronised the parse) | refused, `DCF_SER_ERR_POLICY` | never |
+| `payload_len` above 16 MiB accepted | `DCF_SER_ERR_TOO_LARGE` | never |
+| bytes after the CRC silently accepted | refused, `DCF_SER_ERR_POLICY` | `ALLOW_TRAILING` |
+| `validate()` checked header and CRC only | also walks the payload: it must be well-formed tagged values (depth <= 32, counts, UTF-8, canonical varints) | `ALLOW_UNSTRUCTURED` (skip the walk); `ALLOW_NONCANONICAL_VARINT`; `ALLOW_INVALID_UTF8` |
+| `dcf_ser_reader_skip` advanced without bounds checks (`remaining()` could underflow to ~2^64), recursed without limit (stack overflow on nested headers), and its MAP count overflowed `uint32_t` | bounds-checked, iterative, depth-limited, all-or-nothing (position unchanged on error); `DCF_SER_ERR_TRUNCATED` / `DCF_SER_ERR_DEPTH_EXCEEDED` | never |
+| `read_raw` / `read_raw_ptr` could wrap on a huge length and copy out of bounds | `DCF_SER_ERR_TRUNCATED` | never |
+| `read_array_begin` / `read_map_begin` returned any `uint32_t` count | refused above `DCF_SER_MAX_ARRAY` or more than the bytes left | never |
+| `read_string` ignored `DCF_SER_MAX_STRING` and UTF-8 | refused above 64 KiB (`TOO_LARGE`) or invalid UTF-8 (`MALFORMED`) | `ALLOW_INVALID_UTF8` for UTF-8 only |
+| `read_string_copy` accepted an embedded NUL (the C string was silently truncated) | `DCF_SER_ERR_MALFORMED` | never |
+| `read_varint` accepted overlong encodings and silently dropped bits of a 10th byte above 1 | overlong: `MALFORMED`; 10th byte above 1: `OVERFLOW` | `ALLOW_NONCANONICAL_VARINT` for overlong only |
+| schema reads: `DCF_FIELD_REQUIRED` never enforced, a repeated field id silently last-wins | missing required field / repeated id: `MALFORMED`; field header type differing from the schema: `TYPE_MISMATCH` | `LAX_SCHEMA` |
+| schema reads silently **dropped** `DCF_TYPE_STRING` fields that `dcf_ser_write_struct_schema` can write | the schema is refused up front, `DCF_SER_ERR_INVALID_TYPE` (a string cannot be read into a struct; use the typed API) | never |
+| a schema field whose type, size or offset did not fit the type / `struct_size` became a wire-driven overflow; fields were loaded and stored through misaligned casts | `DCF_SER_ERR_INVALID_ARG` / `INVALID_TYPE` before any access; at most `DCF_SER_MAX_SCHEMA_FIELDS` (256) fields; `memcpy` loads and stores; the struct is zeroed on error | never |
+| `dcf_ser_reader_init` left the reader untouched on error | leaves a zeroed (empty, strict) reader | n/a |
+
+**Writer**
+
+| before | now |
+|---|---|
+| a failed write was forgotten: `last_error` was not always set and `finish()` produced a CRC-valid, truncated frame | errors are sticky; every later call and `finish()` return the first error |
+| `finish()` twice appended a second CRC; writes after `finish()` corrupted the buffer | the second `finish()` and any write after it return `DCF_SER_ERR_INVALID_ARG` |
+| `write_string_n` / `write_bytes` with `(NULL, len > 0)` wrote a length prefix and no bytes | `DCF_SER_ERR_NULL_PTR` |
+| `write_string*` accepted any bytes although strings are UTF-8 | invalid UTF-8 is `DCF_SER_ERR_MALFORMED` (use `write_bytes` for binary) |
+| `write_raw` / `write_reserve` and buffer growth did arithmetic that could wrap (out-of-bounds `memcpy`; an infinite loop in `writer_grow`) | overflow-safe; a length above `DCF_SER_MAX_MESSAGE` is `DCF_SER_ERR_TOO_LARGE` |
+| the payload was uncapped for external buffers | capped at `DCF_SER_MAX_MESSAGE`; `finish()` refuses more |
+| `dcf_ser_write_array_end` documented "validates count" but did not | the documentation is corrected: it only closes the nesting level |
+
+**CRC-32 (a wire-visible fix, found by the gate's differential test).** `crc32_table[245]`
+was `0xCDD706B3`; the IEEE 802.3 value is `0xCDD70693`. `dcf_ser_crc32()` therefore was
+not CRC-32 for any input that looks up entry 245 (about one table lookup in 256). Measured on
+100,000 random buffers per size: the two CRCs differ for 7.7% of 20-byte buffers, 32.5% of
+100-byte, 54% of 200-byte, 98% of 1 KiB buffers (real frames are not random bytes, so treat
+these as an estimate). The documented test vector (`"123456789"`) never touches the entry. The table is corrected. **A corrected node and an
+uncorrected node reject each other's frames whenever entry 245 is hit.** Upgrade
+readers first with `DCF_SER_POLICY_ALLOW_LEGACY_CRC` (accepts the standard CRC *or* the old
+one, nothing else relaxed; the gate is not consulted under it), then writers, then drop the flag.
+
+**Framing.** `dcf_ser_message_length()` reads 17 bytes blind and returned unvalidated sizes
+up to 4 GiB + 21. It is **deprecated** (a compiler warning; silence with
+`-DDCF_SER_NO_DEPRECATION_WARNINGS`) and now returns 0 for what the new
+`dcf_ser_message_length_checked(data, avail, &total)` refuses (too short, wrong magic or major
+version, `payload_len` above 16 MiB).
+
+**API / ABI.** `DCFSerReader` has a new trailing member `uint32_t policy`: **recompile
+consumers** (the shared object keeps its name `libdcf_serialize.so.5.2.0`; whether to bump the
+soname is the owner's decision). New: `dcf_ser_reader_set_policy`, `dcf_ser_validate_payload`,
+`dcf_ser_message_length_checked`, `dcf_ser_gate_disagreements`, `DCF_SER_ERR_POLICY` (`0x208`),
+`DCF_SER_FLAG_RESERVED`, `DCF_SER_MAX_SCHEMA_FIELDS`, the `DCF_SER_POLICY_*` flags and the
+feature macro `DCF_SER_HARDENED_API`.
+
+**Not changed:** `DCF_SER_VERSION` (5.2.0), the header layout, the type tags, and the round trip of a
+frame built with the typed writer functions (with a CRC, honest array counts, UTF-8 strings): the
+hostile suite and the fuzzer both check that what the writer finishes the strict reader accepts.
+Payloads built with `dcf_ser_write_raw` / `dcf_ser_write_reserve` need `ALLOW_UNSTRUCTURED` to be read back.
 
 ## Quick Start
 
@@ -55,15 +178,34 @@ docker load < ./result
 # Build library and tests
 make
 
-# Run tests
+# Run tests: unit, hostile-input regression suite, C-vs-Exsecutor-gate differential, trap guard
 make test
 
 # Install system-wide
 sudo make install PREFIX=/usr/local
 
-# Build with debug symbols and sanitizers
+# Build with debug symbols and sanitizers (a sanitizer report fails the run)
 make DEBUG=1 test
+
+# Fuzz the reader, the writer and the C/gate agreement (FUZZ_SECONDS=120 by default)
+make fuzz
+
+# Valgrind over the test programs
+make memcheck
+
+# Without the Exsecutor gate / without the hardening flags
+make GATE=0 test
+make HARDEN=0 test
 ```
+
+`make clean` between switching `DEBUG`, `GATE` or `HARDEN`: object files do not track flags.
+`make fuzz` builds a deterministic mutation fuzzer under ASan+UBSan that needs only a C compiler and
+runs it for `FUZZ_SECONDS` (default 120). With a clang that has the libFuzzer runtime,
+`make fuzz CC=clang FUZZ_ENGINE=libfuzzer` builds a coverage-guided target instead (the distro clang in
+the development sandbox had no runtime; `nix shell nixpkgs#clang -c make fuzz CC=clang FUZZ_ENGINE=libfuzzer`
+did). Both drive the same entry point (`dcf_serialize_fuzz.c`): the reader on raw frames and on payloads
+wrapped in a valid header, the writer round trip, and the C-versus-gate agreement. The `Dockerfile` runtime
+image runs as an unprivileged user.
 
 ### Using Docker
 
@@ -122,7 +264,11 @@ static uint64_t get_timestamp_us(void) {
     return (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
 }
 
-/* Serialize captured data into DCF format */
+/* Serialize captured data into DCF format.
+ *
+ * Every dcf_ser_write_* result is checked. Writer errors are sticky -- a failed
+ * write makes dcf_ser_writer_finish() fail too -- but checking each call says
+ * where it went wrong, and a frame that did not fit is dropped, not sent short. */
 static int serialize_capture(const void* raw_data, size_t raw_len,
                              uint16_t src_port, uint32_t sequence,
                              uint8_t* out_buf, size_t out_cap, size_t* out_len) {
@@ -136,17 +282,22 @@ static int serialize_capture(const void* raw_data, size_t raw_len,
     
     dcf_ser_writer_set_sequence(&writer, sequence);
     
-    /* Write metadata */
-    dcf_ser_write_timestamp(&writer, get_timestamp_us());  /* Capture time */
-    dcf_ser_write_u16(&writer, src_port);                  /* Source port */
-    dcf_ser_write_u32(&writer, (uint32_t)raw_len);         /* Original length */
+    DCFSerError err;
     
-    /* Write the captured payload */
-    dcf_ser_write_bytes(&writer, raw_data, raw_len);
+    /* Write metadata */
+    if ((err = dcf_ser_write_timestamp(&writer, get_timestamp_us())) != DCF_SER_OK ||  /* Capture time */
+        (err = dcf_ser_write_u16(&writer, src_port)) != DCF_SER_OK ||                  /* Source port */
+        (err = dcf_ser_write_u32(&writer, (uint32_t)raw_len)) != DCF_SER_OK ||         /* Original length */
+        /* Write the captured payload */
+        (err = dcf_ser_write_bytes(&writer, raw_data, raw_len)) != DCF_SER_OK) {
+        fprintf(stderr, "[DCF Relay] write failed: %s\n", dcf_ser_error_str(err));
+        return -1;
+    }
     
     /* Finalize - adds header and CRC */
     const uint8_t* data;
-    if (dcf_ser_writer_finish(&writer, &data, out_len) != DCF_SER_OK) {
+    if ((err = dcf_ser_writer_finish(&writer, &data, out_len)) != DCF_SER_OK) {
+        fprintf(stderr, "[DCF Relay] finish failed: %s\n", dcf_ser_error_str(err));
         return -1;
     }
     
@@ -318,9 +469,12 @@ static int process_dcf_message(const uint8_t* data, size_t len) {
         uint16_t src_port;
         uint32_t original_len;
         
-        dcf_ser_read_timestamp(&reader, &timestamp);
-        dcf_ser_read_u16(&reader, &src_port);
-        dcf_ser_read_u32(&reader, &original_len);
+        if (dcf_ser_read_timestamp(&reader, &timestamp) != DCF_SER_OK ||
+            dcf_ser_read_u16(&reader, &src_port) != DCF_SER_OK ||
+            dcf_ser_read_u32(&reader, &original_len) != DCF_SER_OK) {
+            fprintf(stderr, "[Receiver] Malformed capture header\n");
+            return -1;
+        }
         
         char ts_str[64];
         format_timestamp(timestamp, ts_str, sizeof(ts_str));
@@ -333,7 +487,10 @@ static int process_dcf_message(const uint8_t* data, size_t len) {
         /* Read the captured payload (zero-copy) */
         const void* payload;
         size_t payload_len;
-        dcf_ser_read_bytes(&reader, &payload, &payload_len);
+        if (dcf_ser_read_bytes(&reader, &payload, &payload_len) != DCF_SER_OK) {
+            fprintf(stderr, "[Receiver] Malformed capture payload\n");
+            return -1;
+        }
         
         printf("  --- Payload (%zu bytes) ---\n", payload_len);
         
@@ -417,10 +574,12 @@ int main(int argc, char** argv) {
                 break;
             }
             
-            /* Get total message length from header */
-            size_t msg_len = dcf_ser_message_length(header_buf);
-            if (msg_len == 0 || msg_len > BUFFER_SIZE) {
-                fprintf(stderr, "[Receiver] Invalid message length: %zu\n", msg_len);
+            /* Get the total message length from the header -- checked: it validates
+             * the magic, the major version and the length cap before returning one */
+            size_t msg_len;
+            DCFSerError lerr = dcf_ser_message_length_checked(header_buf, sizeof(header_buf), &msg_len);
+            if (lerr != DCF_SER_OK || msg_len > BUFFER_SIZE) {
+                fprintf(stderr, "[Receiver] Invalid message length: %s\n", dcf_ser_error_str(lerr));
                 break;
             }
             
@@ -435,8 +594,8 @@ int main(int argc, char** argv) {
                 }
             }
             
-            /* Process the complete DCF message */
-            process_dcf_message(msg_buf, msg_len);
+            /* Process the complete DCF message (strict reader: CRC required, nothing after the frame) */
+            (void)process_dcf_message(msg_buf, msg_len);
         }
         
         close(client);
@@ -463,6 +622,7 @@ For low-latency applications (gaming, real-time telemetry), here's a UDP variant
 
 #include "dcf_serialize.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -488,18 +648,29 @@ int main(int argc, char** argv) {
     /* Send telemetry every 100ms */
     while (1) {
         DCFSerWriter w;
-        dcf_ser_writer_init_buffer(&w, buf, sizeof(buf), MSG_TELEMETRY, 
-                                    DCF_SER_FLAG_NO_CRC);  /* Skip CRC for speed */
+        /* Keep the CRC. DCF_SER_FLAG_NO_CRC is possible, but a strict reader refuses
+         * such frames unless it opts in with DCF_SER_POLICY_ALLOW_NO_CRC, and then
+         * nothing checks the bytes at all. */
+        if (dcf_ser_writer_init_buffer(&w, buf, sizeof(buf), MSG_TELEMETRY,
+                                       DCF_SER_FLAG_NONE) != DCF_SER_OK) return 1;
         dcf_ser_writer_set_sequence(&w, seq++);
         
         /* Simulated sensor data */
-        dcf_ser_write_f32(&w, 23.5f + (seq % 10) * 0.1f);  /* Temperature */
-        dcf_ser_write_f32(&w, 45.2f);                       /* Humidity */
-        dcf_ser_write_u32(&w, seq * 100);                   /* Counter */
+        if (dcf_ser_write_f32(&w, 23.5f + (seq % 10) * 0.1f) != DCF_SER_OK ||  /* Temperature */
+            dcf_ser_write_f32(&w, 45.2f) != DCF_SER_OK ||                       /* Humidity */
+            dcf_ser_write_u32(&w, seq * 100) != DCF_SER_OK) {                   /* Counter */
+            fprintf(stderr, "[UDP TX] write failed\n");
+            usleep(100000);
+            continue;
+        }
         
         const uint8_t* data;
         size_t len;
-        dcf_ser_writer_finish(&w, &data, &len);
+        if (dcf_ser_writer_finish(&w, &data, &len) != DCF_SER_OK) {
+            fprintf(stderr, "[UDP TX] finish failed\n");
+            usleep(100000);
+            continue;
+        }
         
         sendto(sock, data, len, 0, (struct sockaddr*)&dest, sizeof(dest));
         printf("[UDP TX] Sent %zu bytes, seq=%u\n", len, seq - 1);
@@ -521,6 +692,7 @@ int main(int argc, char** argv) {
 
 #include "dcf_serialize.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <arpa/inet.h>
 
 enum { MSG_TELEMETRY = 0x2000 };
@@ -548,10 +720,14 @@ int main(int argc, char** argv) {
         if (n <= 0) continue;
         
         DCFSerReader r;
-        dcf_ser_reader_init(&r, buf, n);
+        if (dcf_ser_reader_init(&r, buf, (size_t)n) != DCF_SER_OK) continue;
         
-        if (dcf_ser_reader_validate(&r) != DCF_SER_OK) {
-            printf("[UDP RX] Invalid message\n");
+        /* Strict by default. To accept NO_CRC datagrams from a sender you control:
+         *     dcf_ser_reader_set_policy(&r, DCF_SER_POLICY_ALLOW_NO_CRC);
+         * (between init and validate). */
+        DCFSerError verr = dcf_ser_reader_validate(&r);
+        if (verr != DCF_SER_OK) {
+            printf("[UDP RX] Invalid message: %s\n", dcf_ser_error_str(verr));
             continue;
         }
         
@@ -561,9 +737,12 @@ int main(int argc, char** argv) {
             float temp, humidity;
             uint32_t counter;
             
-            dcf_ser_read_f32(&r, &temp);
-            dcf_ser_read_f32(&r, &humidity);
-            dcf_ser_read_u32(&r, &counter);
+            if (dcf_ser_read_f32(&r, &temp) != DCF_SER_OK ||
+                dcf_ser_read_f32(&r, &humidity) != DCF_SER_OK ||
+                dcf_ser_read_u32(&r, &counter) != DCF_SER_OK) {
+                printf("[UDP RX] Malformed telemetry\n");
+                continue;
+            }
             
             printf("[UDP RX] seq=%u temp=%.1f°C humidity=%.1f%% counter=%u\n",
                    h->sequence, temp, humidity, counter);
@@ -636,17 +815,19 @@ static void mirror_traffic(int mirror_sock, uint16_t msg_type, uint32_t conn_id,
     uint8_t buf[BUF_SIZE + 256];
     DCFSerWriter w;
     
-    dcf_ser_writer_init_buffer(&w, buf, sizeof(buf), msg_type, DCF_SER_FLAG_NONE);
+    if (dcf_ser_writer_init_buffer(&w, buf, sizeof(buf), msg_type, DCF_SER_FLAG_NONE) != DCF_SER_OK) return;
     dcf_ser_writer_set_sequence(&w, next_seq());
     
-    dcf_ser_write_u32(&w, conn_id);
-    dcf_ser_write_timestamp(&w, /* timestamp */
-        (uint64_t)time(NULL) * 1000000ULL);
-    dcf_ser_write_bytes(&w, data, len);
+    if (dcf_ser_write_u32(&w, conn_id) != DCF_SER_OK ||
+        dcf_ser_write_timestamp(&w, /* timestamp */
+            (uint64_t)time(NULL) * 1000000ULL) != DCF_SER_OK ||
+        dcf_ser_write_bytes(&w, data, len) != DCF_SER_OK) {
+        return;                                  /* does not fit: drop the mirror copy, never send it short */
+    }
     
     const uint8_t* out;
     size_t out_len;
-    dcf_ser_writer_finish(&w, &out, &out_len);
+    if (dcf_ser_writer_finish(&w, &out, &out_len) != DCF_SER_OK) return;
     
     send(mirror_sock, out, out_len, MSG_NOSIGNAL);
 }
@@ -807,7 +988,10 @@ dcf_ser_writer_destroy(&writer);
 DCFSerReader reader;
 dcf_ser_reader_init(&reader, buffer, buffer_len);
 
-// Validate message (checks magic, version, CRC)
+// Strict by default. On a trusted channel, opt in to what you need, e.g.:
+//   dcf_ser_reader_set_policy(&reader, DCF_SER_POLICY_ALLOW_NO_CRC);
+
+// Validate message (magic, version, flags, length, CRC, and the payload's structure)
 DCFSerError err = dcf_ser_reader_validate(&reader);
 if (err != DCF_SER_OK) {
     fprintf(stderr, "Invalid message: %s\n", dcf_ser_error_str(err));
@@ -817,16 +1001,16 @@ if (err != DCF_SER_OK) {
 // Check message type
 uint16_t msg_type = dcf_ser_reader_msg_type(&reader);
 
-// Read data (zero-copy for strings/bytes)
+// Read data (zero-copy for strings/bytes). Every read can fail on hostile input: check it.
 const char* name;
 size_t name_len;
-dcf_ser_read_string(&reader, &name, &name_len);
-
 uint32_t score;
-dcf_ser_read_u32(&reader, &score);
-
 float position;
-dcf_ser_read_f32(&reader, &position);
+if (dcf_ser_read_string(&reader, &name, &name_len) != DCF_SER_OK ||
+    dcf_ser_read_u32(&reader, &score) != DCF_SER_OK ||
+    dcf_ser_read_f32(&reader, &position) != DCF_SER_OK) {
+    return;
+}
 ```
 
 ### Schema-Based Serialization
@@ -856,7 +1040,10 @@ static const DCFSerSchema player_schema = {
 Player p = {.id = 123, .active = true, .score = 98.5f};
 dcf_ser_write_struct_schema(&writer, &p, &player_schema);
 
-// Deserialize
+// Deserialize: strict -- a DCF_FIELD_REQUIRED field that is missing, or an id sent
+// twice, is an error (DCF_SER_POLICY_LAX_SCHEMA relaxes it); unknown ids are skipped.
+// Every field must be the size its type implies and lie inside struct_size.
+// DCF_TYPE_STRING cannot be read into a struct: read such fields with the typed API.
 Player decoded;
 dcf_ser_read_struct_schema(&reader, &decoded, &player_schema);
 ```
