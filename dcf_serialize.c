@@ -55,6 +55,16 @@
     } \
 } while(0)
 
+/* Typed reads are all-or-nothing: if one fails, the reader is exactly where it was (the tag byte
+ * a mismatched read had already looked at is not consumed), so a caller can try another read, ask
+ * for a bigger buffer, or dcf_ser_reader_skip() the value. */
+#define READ_ATOMIC(r, call) do { \
+    size_t _start = (r)->position; \
+    DCFSerError _e = (call); \
+    if (_e != DCF_SER_OK) (r)->position = _start; \
+    return _e; \
+} while(0)
+
 /* Writer: refuse any call on a NULL, finished, destroyed or already-failed writer. */
 #define WRITER_ENTER(w) do { \
     if (!(w)) return DCF_SER_ERR_NULL_PTR; \
@@ -349,10 +359,16 @@ static DCFSerError writer_put_u64(DCFSerWriter* w, uint64_t val) {
  * Writer API Implementation
  * ============================================================================ */
 
+/* Flag bits no reader of this library will ever accept (EXTENDED, reserved): a frame carrying them is
+ * a frame nobody can read, so the writer refuses to start one. The other flags are the reader's
+ * policy to accept or refuse (NO_CRC, COMPRESSED, ENCRYPTED) and are written as asked. */
+#define WRITER_FLAGS_NEVER (DCF_SER_FLAG_EXTENDED | DCF_SER_FLAG_RESERVED)
+
 DCFSerError dcf_ser_writer_init(DCFSerWriter* writer, uint16_t msg_type, uint8_t flags) {
     if (!writer) return DCF_SER_ERR_NULL_PTR;
     
     memset(writer, 0, sizeof(DCFSerWriter));
+    if (flags & WRITER_FLAGS_NEVER) return DCF_SER_ERR_INVALID_ARG;
     
     writer->buffer = (uint8_t*)malloc(DCF_SER_INITIAL_CAP);
     if (!writer->buffer) return DCF_SER_ERR_ALLOC_FAIL;
@@ -374,6 +390,7 @@ DCFSerError dcf_ser_writer_init_buffer(DCFSerWriter* writer, uint8_t* buffer,
     if (capacity < sizeof(DCFSerHeader) + 4) return DCF_SER_ERR_BUFFER_FULL;
     
     memset(writer, 0, sizeof(DCFSerWriter));
+    if (flags & WRITER_FLAGS_NEVER) return DCF_SER_ERR_INVALID_ARG;
     
     writer->buffer = buffer;
     writer->capacity = capacity;
@@ -404,6 +421,8 @@ void dcf_ser_writer_reset(DCFSerWriter* writer, uint16_t msg_type, uint8_t flags
     writer->sequence = 0;
     writer->header_written = false;
     writer->last_error = DCF_SER_OK;
+    /* reset has no result to return: flags no reader accepts fail the writer closed instead */
+    if (flags & WRITER_FLAGS_NEVER) writer->last_error = DCF_SER_ERR_INVALID_ARG;
 }
 
 DCFSerError dcf_ser_writer_finish(DCFSerWriter* writer, const uint8_t** out_data, size_t* out_len) {
@@ -1046,6 +1065,7 @@ DCFSerError dcf_ser_reader_validate(DCFSerReader* reader) {
     reader->payload_start = 0;
     reader->payload_end = 0;
     reader->position = 0;
+    reader->depth = 0;          /* a reader pointed at a new frame starts at nesting depth 0 */
     if (!reader->buffer || reader->length < sizeof(DCFSerHeader)) {
         reader->last_error = DCF_SER_ERR_TRUNCATED;
         return DCF_SER_ERR_TRUNCATED;
@@ -1211,11 +1231,16 @@ DCFSerError dcf_ser_reader_skip(DCFSerReader* reader) {
  * Primitive Readers
  * ---------------------------------------------------------------------------- */
 
-DCFSerError dcf_ser_read_null(DCFSerReader* r) {
+static DCFSerError read_null_impl(DCFSerReader* r) {
     return reader_expect_type(r, DCF_TYPE_NULL);
 }
 
-DCFSerError dcf_ser_read_bool(DCFSerReader* r, bool* out) {
+DCFSerError dcf_ser_read_null(DCFSerReader* r) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_null_impl(r));
+}
+
+static DCFSerError read_bool_impl(DCFSerReader* r, bool* out) {
     if (!r || !out) return DCF_SER_ERR_NULL_PTR;
     DCF_SER_CHECK(reader_expect_type(r, DCF_TYPE_BOOL));
     uint8_t val;
@@ -1224,55 +1249,100 @@ DCFSerError dcf_ser_read_bool(DCFSerReader* r, bool* out) {
     return DCF_SER_OK;
 }
 
-DCFSerError dcf_ser_read_u8(DCFSerReader* r, uint8_t* out) {
+DCFSerError dcf_ser_read_bool(DCFSerReader* r, bool* out) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_bool_impl(r, out));
+}
+
+static DCFSerError read_u8_impl(DCFSerReader* r, uint8_t* out) {
     if (!r || !out) return DCF_SER_ERR_NULL_PTR;
     DCF_SER_CHECK(reader_expect_type(r, DCF_TYPE_U8));
     return reader_get_u8(r, out);
 }
 
-DCFSerError dcf_ser_read_i8(DCFSerReader* r, int8_t* out) {
+DCFSerError dcf_ser_read_u8(DCFSerReader* r, uint8_t* out) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_u8_impl(r, out));
+}
+
+static DCFSerError read_i8_impl(DCFSerReader* r, int8_t* out) {
     if (!r || !out) return DCF_SER_ERR_NULL_PTR;
     DCF_SER_CHECK(reader_expect_type(r, DCF_TYPE_I8));
     return reader_get_u8(r, (uint8_t*)out);
 }
 
-DCFSerError dcf_ser_read_u16(DCFSerReader* r, uint16_t* out) {
+DCFSerError dcf_ser_read_i8(DCFSerReader* r, int8_t* out) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_i8_impl(r, out));
+}
+
+static DCFSerError read_u16_impl(DCFSerReader* r, uint16_t* out) {
     if (!r || !out) return DCF_SER_ERR_NULL_PTR;
     DCF_SER_CHECK(reader_expect_type(r, DCF_TYPE_U16));
     return reader_get_u16(r, out);
 }
 
-DCFSerError dcf_ser_read_i16(DCFSerReader* r, int16_t* out) {
+DCFSerError dcf_ser_read_u16(DCFSerReader* r, uint16_t* out) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_u16_impl(r, out));
+}
+
+static DCFSerError read_i16_impl(DCFSerReader* r, int16_t* out) {
     if (!r || !out) return DCF_SER_ERR_NULL_PTR;
     DCF_SER_CHECK(reader_expect_type(r, DCF_TYPE_I16));
     return reader_get_u16(r, (uint16_t*)out);
 }
 
-DCFSerError dcf_ser_read_u32(DCFSerReader* r, uint32_t* out) {
+DCFSerError dcf_ser_read_i16(DCFSerReader* r, int16_t* out) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_i16_impl(r, out));
+}
+
+static DCFSerError read_u32_impl(DCFSerReader* r, uint32_t* out) {
     if (!r || !out) return DCF_SER_ERR_NULL_PTR;
     DCF_SER_CHECK(reader_expect_type(r, DCF_TYPE_U32));
     return reader_get_u32(r, out);
 }
 
-DCFSerError dcf_ser_read_i32(DCFSerReader* r, int32_t* out) {
+DCFSerError dcf_ser_read_u32(DCFSerReader* r, uint32_t* out) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_u32_impl(r, out));
+}
+
+static DCFSerError read_i32_impl(DCFSerReader* r, int32_t* out) {
     if (!r || !out) return DCF_SER_ERR_NULL_PTR;
     DCF_SER_CHECK(reader_expect_type(r, DCF_TYPE_I32));
     return reader_get_u32(r, (uint32_t*)out);
 }
 
-DCFSerError dcf_ser_read_u64(DCFSerReader* r, uint64_t* out) {
+DCFSerError dcf_ser_read_i32(DCFSerReader* r, int32_t* out) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_i32_impl(r, out));
+}
+
+static DCFSerError read_u64_impl(DCFSerReader* r, uint64_t* out) {
     if (!r || !out) return DCF_SER_ERR_NULL_PTR;
     DCF_SER_CHECK(reader_expect_type(r, DCF_TYPE_U64));
     return reader_get_u64(r, out);
 }
 
-DCFSerError dcf_ser_read_i64(DCFSerReader* r, int64_t* out) {
+DCFSerError dcf_ser_read_u64(DCFSerReader* r, uint64_t* out) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_u64_impl(r, out));
+}
+
+static DCFSerError read_i64_impl(DCFSerReader* r, int64_t* out) {
     if (!r || !out) return DCF_SER_ERR_NULL_PTR;
     DCF_SER_CHECK(reader_expect_type(r, DCF_TYPE_I64));
     return reader_get_u64(r, (uint64_t*)out);
 }
 
-DCFSerError dcf_ser_read_f32(DCFSerReader* r, float* out) {
+DCFSerError dcf_ser_read_i64(DCFSerReader* r, int64_t* out) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_i64_impl(r, out));
+}
+
+static DCFSerError read_f32_impl(DCFSerReader* r, float* out) {
     if (!r || !out) return DCF_SER_ERR_NULL_PTR;
     DCF_SER_CHECK(reader_expect_type(r, DCF_TYPE_F32));
     uint32_t bits;
@@ -1281,7 +1351,12 @@ DCFSerError dcf_ser_read_f32(DCFSerReader* r, float* out) {
     return DCF_SER_OK;
 }
 
-DCFSerError dcf_ser_read_f64(DCFSerReader* r, double* out) {
+DCFSerError dcf_ser_read_f32(DCFSerReader* r, float* out) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_f32_impl(r, out));
+}
+
+static DCFSerError read_f64_impl(DCFSerReader* r, double* out) {
     if (!r || !out) return DCF_SER_ERR_NULL_PTR;
     DCF_SER_CHECK(reader_expect_type(r, DCF_TYPE_F64));
     uint64_t bits;
@@ -1290,11 +1365,16 @@ DCFSerError dcf_ser_read_f64(DCFSerReader* r, double* out) {
     return DCF_SER_OK;
 }
 
+DCFSerError dcf_ser_read_f64(DCFSerReader* r, double* out) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_f64_impl(r, out));
+}
+
 /* ----------------------------------------------------------------------------
  * Variable-Length Readers
  * ---------------------------------------------------------------------------- */
 
-DCFSerError dcf_ser_read_varint(DCFSerReader* r, uint64_t* out) {
+static DCFSerError read_varint_impl(DCFSerReader* r, uint64_t* out) {
     if (!r || !out) return DCF_SER_ERR_NULL_PTR;
     DCF_SER_CHECK(reader_expect_type(r, DCF_TYPE_VARINT));
     
@@ -1325,7 +1405,12 @@ DCFSerError dcf_ser_read_varint(DCFSerReader* r, uint64_t* out) {
     return DCF_SER_OK;
 }
 
-DCFSerError dcf_ser_read_varsint(DCFSerReader* r, int64_t* out) {
+DCFSerError dcf_ser_read_varint(DCFSerReader* r, uint64_t* out) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_varint_impl(r, out));
+}
+
+static DCFSerError read_varsint_impl(DCFSerReader* r, int64_t* out) {
     if (!r || !out) return DCF_SER_ERR_NULL_PTR;
     
     uint64_t zigzag;
@@ -1337,7 +1422,12 @@ DCFSerError dcf_ser_read_varsint(DCFSerReader* r, int64_t* out) {
     return DCF_SER_OK;
 }
 
-DCFSerError dcf_ser_read_string(DCFSerReader* r, const char** out_str, size_t* out_len) {
+DCFSerError dcf_ser_read_varsint(DCFSerReader* r, int64_t* out) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_varsint_impl(r, out));
+}
+
+static DCFSerError read_string_impl(DCFSerReader* r, const char** out_str, size_t* out_len) {
     if (!r || !out_str || !out_len) return DCF_SER_ERR_NULL_PTR;
     DCF_SER_CHECK(reader_expect_type(r, DCF_TYPE_STRING));
     
@@ -1363,7 +1453,12 @@ DCFSerError dcf_ser_read_string(DCFSerReader* r, const char** out_str, size_t* o
     return DCF_SER_OK;
 }
 
-DCFSerError dcf_ser_read_string_copy(DCFSerReader* r, char* buf, size_t buf_size, size_t* out_len) {
+DCFSerError dcf_ser_read_string(DCFSerReader* r, const char** out_str, size_t* out_len) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_string_impl(r, out_str, out_len));
+}
+
+static DCFSerError read_string_copy_impl(DCFSerReader* r, char* buf, size_t buf_size, size_t* out_len) {
     if (!r || !buf || !out_len) return DCF_SER_ERR_NULL_PTR;
     
     const char* str;
@@ -1388,7 +1483,12 @@ DCFSerError dcf_ser_read_string_copy(DCFSerReader* r, char* buf, size_t buf_size
     return DCF_SER_OK;
 }
 
-DCFSerError dcf_ser_read_bytes(DCFSerReader* r, const void** out_data, size_t* out_len) {
+DCFSerError dcf_ser_read_string_copy(DCFSerReader* r, char* buf, size_t buf_size, size_t* out_len) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_string_copy_impl(r, buf, buf_size, out_len));
+}
+
+static DCFSerError read_bytes_impl(DCFSerReader* r, const void** out_data, size_t* out_len) {
     if (!r || !out_data || !out_len) return DCF_SER_ERR_NULL_PTR;
     DCF_SER_CHECK(reader_expect_type(r, DCF_TYPE_BYTES));
     
@@ -1404,7 +1504,12 @@ DCFSerError dcf_ser_read_bytes(DCFSerReader* r, const void** out_data, size_t* o
     return DCF_SER_OK;
 }
 
-DCFSerError dcf_ser_read_bytes_copy(DCFSerReader* r, void* buf, size_t buf_size, size_t* out_len) {
+DCFSerError dcf_ser_read_bytes(DCFSerReader* r, const void** out_data, size_t* out_len) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_bytes_impl(r, out_data, out_len));
+}
+
+static DCFSerError read_bytes_copy_impl(DCFSerReader* r, void* buf, size_t buf_size, size_t* out_len) {
     if (!r || !buf || !out_len) return DCF_SER_ERR_NULL_PTR;
     
     const void* data;
@@ -1422,7 +1527,12 @@ DCFSerError dcf_ser_read_bytes_copy(DCFSerReader* r, void* buf, size_t buf_size,
     return DCF_SER_OK;
 }
 
-DCFSerError dcf_ser_read_uuid(DCFSerReader* r, uint8_t out_uuid[16]) {
+DCFSerError dcf_ser_read_bytes_copy(DCFSerReader* r, void* buf, size_t buf_size, size_t* out_len) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_bytes_copy_impl(r, buf, buf_size, out_len));
+}
+
+static DCFSerError read_uuid_impl(DCFSerReader* r, uint8_t out_uuid[16]) {
     if (!r || !out_uuid) return DCF_SER_ERR_NULL_PTR;
     DCF_SER_CHECK(reader_expect_type(r, DCF_TYPE_UUID));
     
@@ -1433,17 +1543,27 @@ DCFSerError dcf_ser_read_uuid(DCFSerReader* r, uint8_t out_uuid[16]) {
     return DCF_SER_OK;
 }
 
-DCFSerError dcf_ser_read_timestamp(DCFSerReader* r, uint64_t* out_us) {
+DCFSerError dcf_ser_read_uuid(DCFSerReader* r, uint8_t out_uuid[16]) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_uuid_impl(r, out_uuid));
+}
+
+static DCFSerError read_timestamp_impl(DCFSerReader* r, uint64_t* out_us) {
     if (!r || !out_us) return DCF_SER_ERR_NULL_PTR;
     DCF_SER_CHECK(reader_expect_type(r, DCF_TYPE_TIMESTAMP));
     return reader_get_u64(r, out_us);
+}
+
+DCFSerError dcf_ser_read_timestamp(DCFSerReader* r, uint64_t* out_us) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_timestamp_impl(r, out_us));
 }
 
 /* ----------------------------------------------------------------------------
  * Container Readers
  * ---------------------------------------------------------------------------- */
 
-DCFSerError dcf_ser_read_array_begin(DCFSerReader* r, DCFSerType* out_elem_type, size_t* out_count) {
+static DCFSerError read_array_begin_impl(DCFSerReader* r, DCFSerType* out_elem_type, size_t* out_count) {
     if (!r || !out_elem_type || !out_count) return DCF_SER_ERR_NULL_PTR;
     if (r->depth >= DCF_SER_MAX_DEPTH) return DCF_SER_ERR_DEPTH_EXCEEDED;
     
@@ -1473,6 +1593,11 @@ DCFSerError dcf_ser_read_array_begin(DCFSerReader* r, DCFSerType* out_elem_type,
     return DCF_SER_OK;
 }
 
+DCFSerError dcf_ser_read_array_begin(DCFSerReader* r, DCFSerType* out_elem_type, size_t* out_count) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_array_begin_impl(r, out_elem_type, out_count));
+}
+
 DCFSerError dcf_ser_read_array_end(DCFSerReader* r) {
     if (!r) return DCF_SER_ERR_NULL_PTR;
     if (r->depth == 0) return DCF_SER_ERR_MALFORMED;
@@ -1480,7 +1605,7 @@ DCFSerError dcf_ser_read_array_end(DCFSerReader* r) {
     return DCF_SER_OK;
 }
 
-DCFSerError dcf_ser_read_map_begin(DCFSerReader* r, DCFSerType* out_key_type,
+static DCFSerError read_map_begin_impl(DCFSerReader* r, DCFSerType* out_key_type,
                                     DCFSerType* out_val_type, size_t* out_count) {
     if (!r || !out_key_type || !out_val_type || !out_count) return DCF_SER_ERR_NULL_PTR;
     if (r->depth >= DCF_SER_MAX_DEPTH) return DCF_SER_ERR_DEPTH_EXCEEDED;
@@ -1510,6 +1635,11 @@ DCFSerError dcf_ser_read_map_begin(DCFSerReader* r, DCFSerType* out_key_type,
     return DCF_SER_OK;
 }
 
+DCFSerError dcf_ser_read_map_begin(DCFSerReader* r, DCFSerType* out_key_type, DCFSerType* out_val_type, size_t* out_count) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_map_begin_impl(r, out_key_type, out_val_type, out_count));
+}
+
 DCFSerError dcf_ser_read_map_end(DCFSerReader* r) {
     if (!r) return DCF_SER_ERR_NULL_PTR;
     if (r->depth == 0) return DCF_SER_ERR_MALFORMED;
@@ -1517,7 +1647,7 @@ DCFSerError dcf_ser_read_map_end(DCFSerReader* r) {
     return DCF_SER_OK;
 }
 
-DCFSerError dcf_ser_read_struct_begin(DCFSerReader* r, uint16_t* out_type_id) {
+static DCFSerError read_struct_begin_impl(DCFSerReader* r, uint16_t* out_type_id) {
     if (!r || !out_type_id) return DCF_SER_ERR_NULL_PTR;
     if (r->depth >= DCF_SER_MAX_DEPTH) return DCF_SER_ERR_DEPTH_EXCEEDED;
     
@@ -1528,13 +1658,24 @@ DCFSerError dcf_ser_read_struct_begin(DCFSerReader* r, uint16_t* out_type_id) {
     return DCF_SER_OK;
 }
 
+DCFSerError dcf_ser_read_struct_begin(DCFSerReader* r, uint16_t* out_type_id) {
+    if (!r) return DCF_SER_ERR_NULL_PTR;
+    READ_ATOMIC(r, read_struct_begin_impl(r, out_type_id));
+}
+
 DCFSerError dcf_ser_read_field(DCFSerReader* r, uint16_t* out_field_id, DCFSerType* out_type) {
     if (!r || !out_field_id || !out_type) return DCF_SER_ERR_NULL_PTR;
     
-    DCF_SER_CHECK(reader_get_u16(r, out_field_id));
-    
+    /* All-or-nothing like the other typed reads, except that the end marker (NOT_FOUND) is
+     * consumed: that is how a struct is walked to its end. */
+    const size_t start = r->position;
     uint8_t type_byte;
-    DCF_SER_CHECK(reader_get_u8(r, &type_byte));
+    DCFSerError e = reader_get_u16(r, out_field_id);
+    if (e == DCF_SER_OK) e = reader_get_u8(r, &type_byte);
+    if (e != DCF_SER_OK) {
+        r->position = start;
+        return e;
+    }
     *out_type = (DCFSerType)type_byte;
     
     /* Check for end marker */
@@ -1558,14 +1699,18 @@ DCFSerError dcf_ser_read_struct_end(DCFSerReader* r) {
 
 DCFSerError dcf_ser_read_raw(DCFSerReader* r, void* out, size_t len) {
     if (!r || !out) return DCF_SER_ERR_NULL_PTR;
+    /* A reader that is not validated (a failed init leaves it zeroed, with no buffer) has nothing
+     * to read, not even zero bytes: memcpy(out, NULL, 0) is undefined behaviour. */
+    if (!r->header_valid || !r->buffer) return DCF_SER_ERR_TRUNCATED;
     READER_ENSURE_BYTES(r, len);
-    memcpy(out, r->buffer + r->position, len);
+    if (len > 0) memcpy(out, r->buffer + r->position, len);
     r->position += len;
     return DCF_SER_OK;
 }
 
 DCFSerError dcf_ser_read_raw_ptr(DCFSerReader* r, const void** out_ptr, size_t len) {
     if (!r || !out_ptr) return DCF_SER_ERR_NULL_PTR;
+    if (!r->header_valid || !r->buffer) return DCF_SER_ERR_TRUNCATED;
     READER_ENSURE_BYTES(r, len);
     *out_ptr = r->buffer + r->position;
     r->position += len;
@@ -1834,11 +1979,52 @@ DCFSerError dcf_ser_write_struct_schema(DCFSerWriter* w, const void* data,
     return DCF_SER_OK;
 }
 
+/* id -> schema index, built once per read: the keys (field_id << 8 | index) of every schema field,
+ * sorted. A wire field is then found by binary search in O(log fields) instead of a scan of the whole
+ * schema per wire field (a 16 MiB struct of 4-byte unknown fields against a 256-field schema cost
+ * 485 ms of CPU that way). Sorting by (id, index) keeps "the first schema entry with that id wins". */
+static void keys_sift_down(uint32_t* a, size_t root, size_t n) {
+    for (;;) {
+        size_t child = 2 * root + 1;
+        if (child >= n) return;
+        if (child + 1 < n && a[child] < a[child + 1]) child++;
+        if (a[root] >= a[child]) return;
+        uint32_t t = a[root]; a[root] = a[child]; a[child] = t;
+        root = child;
+    }
+}
+
+static void keys_sort(uint32_t* a, size_t n) {      /* heapsort: O(n log n), no recursion, no allocation */
+    for (size_t i = n / 2; i-- > 0;) keys_sift_down(a, i, n);
+    for (size_t end = n; end-- > 1;) {
+        uint32_t t = a[0]; a[0] = a[end]; a[end] = t;
+        keys_sift_down(a, 0, end);
+    }
+}
+
+/* index of the first schema field with this id, or n_fields if none */
+static size_t keys_find(const uint32_t* keys, size_t n, uint16_t id) {
+    const uint32_t target = (uint32_t)id << 8;
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (keys[mid] < target) lo = mid + 1; else hi = mid;
+    }
+    if (lo < n && (keys[lo] >> 8) == id) return keys[lo] & 0xFF;
+    return SIZE_MAX;
+}
+
 static DCFSerError read_struct_schema_fields(DCFSerReader* r, void* data,
                                              const DCFSerSchema* schema) {
     const bool lax = (r->policy & DCF_SER_POLICY_LAX_SCHEMA) != 0;
     uint64_t seen[(DCF_SER_MAX_SCHEMA_FIELDS + 63) / 64];
     memset(seen, 0, sizeof seen);
+    
+    uint32_t keys[DCF_SER_MAX_SCHEMA_FIELDS];       /* schema_check() has capped field_count at this */
+    for (size_t i = 0; i < schema->field_count; i++) {
+        keys[i] = ((uint32_t)schema->fields[i].field_id << 8) | (uint32_t)i;
+    }
+    keys_sort(keys, schema->field_count);
     
     uint16_t type_id;
     DCF_SER_CHECK(dcf_ser_read_struct_begin(r, &type_id));
@@ -1860,15 +2046,8 @@ static DCFSerError read_struct_schema_fields(DCFSerReader* r, void* data,
         if (err != DCF_SER_OK) return err;
         
         /* Find field in schema */
-        size_t index = 0;
-        const DCFSerField* field = NULL;
-        for (size_t i = 0; i < schema->field_count; i++) {
-            if (schema->fields[i].field_id == field_id) {
-                field = &schema->fields[i];
-                index = i;
-                break;
-            }
-        }
+        size_t index = keys_find(keys, schema->field_count, field_id);
+        const DCFSerField* field = (index == SIZE_MAX) ? NULL : &schema->fields[index];
         
         if (!field) {
             /* Unknown field, skip it */
@@ -1989,10 +2168,16 @@ DCFSerError dcf_ser_read_struct_schema(DCFSerReader* r, void* data,
      * Refuse the schema up front, independent of what the wire holds. */
     DCF_SER_CHECK(schema_check(schema, true));
     
+    /* One exit: whatever happens inside, a failed read leaves the READER where it was (position and
+     * nesting depth: the struct is still there to skip) and the struct zeroed -- never half-filled
+     * for a caller that ignores the result. (A schema refused above touched neither.) */
+    const size_t position0 = r->position;
+    const size_t depth0 = r->depth;
     DCFSerError err = read_struct_schema_fields(r, data, schema);
     if (err != DCF_SER_OK) {
-        /* Never leave a half-filled struct for a caller that ignores the result. */
+        r->position = position0;
         memset(data, 0, schema->struct_size);
     }
+    r->depth = depth0;
     return err;
 }

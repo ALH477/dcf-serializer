@@ -328,7 +328,10 @@ uint32_t dcf_ser_crc32_update(uint32_t crc, const void* data, size_t len);
  * 
  * @param writer    Writer context to initialize
  * @param msg_type  Application message type
- * @param flags     Message flags
+ * @param flags     Message flags. DCF_SER_FLAG_EXTENDED and DCF_SER_FLAG_RESERVED are refused with
+ *                  DCF_SER_ERR_INVALID_ARG: no reader of this library accepts them. The other flags
+ *                  are written as given; whether a reader accepts NO_CRC / COMPRESSED / ENCRYPTED
+ *                  frames is the reader's policy.
  * @return          DCF_SER_OK on success
  */
 DCFSerError dcf_ser_writer_init(DCFSerWriter* writer, uint16_t msg_type, uint8_t flags);
@@ -352,7 +355,9 @@ DCFSerError dcf_ser_writer_init_buffer(DCFSerWriter* writer, uint8_t* buffer,
 void dcf_ser_writer_destroy(DCFSerWriter* writer);
 
 /**
- * Reset writer for reuse (keeps buffer)
+ * Reset writer for reuse (keeps buffer). Clears the sticky error. Flags a reader can never accept
+ * (EXTENDED, reserved) make the writer fail closed instead of returning a result: the next write
+ * and finish() return DCF_SER_ERR_INVALID_ARG until it is reset with good flags.
  */
 void dcf_ser_writer_reset(DCFSerWriter* writer, uint16_t msg_type, uint8_t flags);
 
@@ -546,7 +551,7 @@ DCFSerError dcf_ser_reader_init(DCFSerReader* reader, const void* data, size_t l
 DCFSerError dcf_ser_reader_set_policy(DCFSerReader* reader, uint32_t policy);
 
 /**
- * Validate and parse the message header.
+ * Validate and parse the message header. Also resets the reader's nesting depth to 0.
  * 
  * Under the default (strict) policy this checks: magic; major version; no
  * EXTENDED/reserved/COMPRESSED/ENCRYPTED flag; a CRC32 is present and correct;
@@ -594,6 +599,10 @@ DCFSerError dcf_ser_reader_skip(DCFSerReader* reader);
  * Primitive Readers
  * ---------------------------------------------------------------------------- */
 
+/* Every typed read below is all-or-nothing: if it returns an error (type mismatch, truncated
+ * body, refused string or varint, copy buffer too small, refused container header), the reader
+ * has not moved. The one exception is dcf_ser_read_field, which consumes the struct end marker
+ * (DCF_SER_ERR_NOT_FOUND) on purpose. A reader that was never validated reads nothing. */
 DCFSerError dcf_ser_read_null(DCFSerReader* r);
 DCFSerError dcf_ser_read_bool(DCFSerReader* r, bool* out);
 DCFSerError dcf_ser_read_u8(DCFSerReader* r, uint8_t* out);
@@ -708,8 +717,14 @@ DCFSerError dcf_ser_write_struct_schema(DCFSerWriter* w, const void* data,
  * a field header whose type differs from the schema, is refused (relax with
  * DCF_SER_POLICY_LAX_SCHEMA). A STRING field cannot be read this way and the
  * schema is refused with DCF_SER_ERR_INVALID_TYPE (it used to be dropped
- * silently); read such fields with the typed API. On any error the struct is
- * left zeroed.
+ * silently); read such fields with the typed API.
+ * 
+ * On a wire-driven error (everything except a refused schema) the struct is left
+ * zeroed AND the reader is left where it was -- position and nesting depth -- so
+ * the struct is still there to dcf_ser_reader_skip(). A schema that is itself
+ * refused (STRING field, a field that does not fit struct_size, too many fields)
+ * touches NOTHING: the struct keeps whatever it held and the reader does not move.
+ * Field lookup is O(log fields) per wire field.
  */
 DCFSerError dcf_ser_read_struct_schema(DCFSerReader* r, void* data,
                                         const DCFSerSchema* schema);

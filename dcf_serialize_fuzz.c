@@ -136,6 +136,7 @@ static void consume(DCFSerReader* r) {
             default:                 e = DCF_SER_ERR_INVALID_TYPE; break;
         }
         invariant(r);
+        if (e != DCF_SER_OK) REQUIRE(r->position == before, "a failed typed read does not move the reader");
         if (e != DCF_SER_OK || r->position == before) {
             /* the typed read refused or did not move: skip must either move or fail without moving */
             size_t at = r->position;
@@ -228,7 +229,27 @@ static int emit_value(DCFSerWriter* w, Cursor* c, unsigned depth) {
             e = dcf_ser_write_varint(w, v >> shift);
             break;
         }
-        case 10: e = dcf_ser_write_varsint(w, (int64_t)next64(c)); break;
+        case 10: {
+            int64_t v = (int64_t)next64(c);
+            if (next8(c) & 1) v >>= (next8(c) % 63);                 /* small magnitudes, both signs */
+            size_t at = w->position;
+            e = dcf_ser_write_varsint(w, v);
+            if (!e) {
+                /* independent decode of what went on the wire: tag, LEB128, textbook ZigZag */
+                REQUIRE(w->buffer[at] == DCF_TYPE_VARINT, "varsint tag");
+                uint64_t u = 0;
+                unsigned shift = 0;
+                size_t i = at + 1;
+                for (; i < w->position; i++, shift += 7) {
+                    u |= (uint64_t)(w->buffer[i] & 0x7F) << shift;
+                    if (!(w->buffer[i] & 0x80)) { i++; break; }
+                }
+                REQUIRE(i == w->position, "varsint is exactly one varint");
+                int64_t back = (int64_t)(u >> 1) ^ -(int64_t)(u & 1);
+                REQUIRE(back == v, "write_varsint wrote the standard ZigZag of its argument");
+            }
+            break;
+        }
         case 11: {
             uint8_t u[16];
             for (int k = 0; k < 16; k++) u[k] = (uint8_t)next8(c);

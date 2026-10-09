@@ -2039,6 +2039,13 @@ static int t_n7_documented_asymmetries(void) {
     CHECK_OK(dcf_ser_writer_finish(&w, &d, &n));
     CHECK_ERR(dcf_ser_validate_message(d, n));
     dcf_ser_writer_destroy(&w);
+    /* 2b. ... and MORE elements than the count: structurally fine, the extra is a top-level value */
+    CHECK_OK(dcf_ser_writer_init(&w, 1, 0));
+    CHECK_OK(dcf_ser_write_array_begin(&w, DCF_TYPE_U8, 1));
+    CHECK_OK(dcf_ser_write_u8(&w, 1)); CHECK_OK(dcf_ser_write_u8(&w, 2)); CHECK_OK(dcf_ser_write_array_end(&w));
+    CHECK_OK(dcf_ser_writer_finish(&w, &d, &n));
+    CHECK_OK(dcf_ser_validate_message(d, n));
+    dcf_ser_writer_destroy(&w);
     /* 3. struct_begin without struct_end */
     CHECK_OK(dcf_ser_writer_init(&w, 1, 0));
     CHECK_OK(dcf_ser_write_struct_begin(&w, 1));
@@ -2285,6 +2292,7 @@ static int run_one(const TestCase* t, int verbose) {
     int pass = WIFEXITED(st) && WEXITSTATUS(st) == 0;
     if (pass) {
         printf("  PASS  %-48s [%s]\n", t->name, t->finding);
+        if (verbose && log[0]) printf("%s", log);          /* -v: a passing test's "info:" lines too */
         return 0;
     }
     char how[48];
